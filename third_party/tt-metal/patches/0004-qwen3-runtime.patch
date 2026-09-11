@@ -1,0 +1,439 @@
+diff --git a/models/common/models/qwen3_32b/demo.py b/models/common/models/qwen3_32b/demo.py
+index 8940f7e54f28fbfc25101dc4140ce9d903ce9b17..47dd055fe19227661bdfa1bc1bd46ba848ae22bc 100644
+--- a/models/common/models/qwen3_32b/demo.py
++++ b/models/common/models/qwen3_32b/demo.py
+@@ -73,9 +73,9 @@ def device_params(request, galaxy_type):
+         if is_single_device:
+             params["fabric_config"] = None
+         elif params["fabric_config"] is True:
+-            params["fabric_config"] = (
+-                ttnn.FabricConfig.FABRIC_1D_RING if galaxy_type == "6U" else ttnn.FabricConfig.FABRIC_1D
+-            )
++            # The 8-chip Galaxy bring-up uses a non-torus 2x4 submesh.  A 6U
++            # chassis does not imply that the selected devices form a ring.
++            params["fabric_config"] = ttnn.FabricConfig.FABRIC_1D
+ 
+     return params
+ 
+diff --git a/models/common/rmsnorm.py b/models/common/rmsnorm.py
+index 5c0b9bb7ecbfbba997d3affb933e2078b3c56f0d..23315a94cb8e60649078398dc97f5b8d7193606c 100644
+--- a/models/common/rmsnorm.py
++++ b/models/common/rmsnorm.py
+@@ -3,6 +3,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ import ttnn
+ from models.common.lightweightmodule import LightweightModule
++from models.tt_transformers.tt.ccl import get_fabric_2d_line_num_links
+ from models.tt_transformers.tt.common import Mode
+ 
+ TILE = 32
+@@ -198,19 +199,25 @@ class RMSNorm(LightweightModule):
+         tt_stats = ttnn.rms_norm_pre_all_gather(
+             inp, compute_kernel_config=compute_kernel_config, dtype=ttnn.bfloat16, memory_config=mc
+         )
++        mesh_shape = list(self.device.shape)
++        fabric_2d_line = 1 in mesh_shape and ttnn.get_fabric_config() == ttnn.FabricConfig.FABRIC_2D
++        cluster_axis = (1 if mesh_shape[0] == 1 else 0) if fabric_2d_line else None
++        topology = ttnn.Topology.Linear if fabric_2d_line else self.ccl_topology
++        num_links = get_fabric_2d_line_num_links(self.device, self.tt_ccl, cluster_axis) if fabric_2d_line else 1
+         # AllGather stats
+         tt_stats = ttnn.experimental.all_gather_async(
+             tt_stats,
+             persistent_output_buffer=None,
+             dim=3,
+-            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
+-            num_links=1,
+-            topology=self.ccl_topology,
++            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis),
++            num_links=num_links,
++            cluster_axis=cluster_axis,
++            topology=topology,
+             memory_config=mc,
+-            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+-            chunks_per_sync=10,
+-            num_workers_per_link=2,
+-            num_buffers_per_channel=2,
++            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
++            chunks_per_sync=None if fabric_2d_line else 10,
++            num_workers_per_link=None if fabric_2d_line else 2,
++            num_buffers_per_channel=None if fabric_2d_line else 2,
+         )
+         # Run distributed rmsnorm part 2
+         tt_out = ttnn.rms_norm_post_all_gather(
+diff --git a/models/tt_transformers/tt/attention.py b/models/tt_transformers/tt/attention.py
+index 4a4f2aaaee6fdc97c596880752e3bc5cbcd9fb24..208f6618d2a776312bcd9912e2f12a10943c0149 100644
+--- a/models/tt_transformers/tt/attention.py
++++ b/models/tt_transformers/tt/attention.py
+@@ -10,7 +10,7 @@ import ttnn
+ from models.common.lightweightmodule import LightweightModule
+ from models.common.rmsnorm import RMSNorm
+ from models.common.utility_functions import nearest_32
+-from models.tt_transformers.tt.ccl import tt_all_gather, tt_all_reduce
++from models.tt_transformers.tt.ccl import get_fabric_2d_line_num_links, tt_all_gather, tt_all_reduce
+ from models.tt_transformers.tt.common import Mode
+ from models.tt_transformers.tt.model_config import OpGroup, TensorGroup, num_to_corerange
+ 
+@@ -771,18 +771,25 @@ class Attention(LightweightModule):
+                     subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+                 )
+             else:
++                mesh_shape = list(self.mesh_device.shape)
++                fabric_2d_line = 1 in mesh_shape and ttnn.get_fabric_config() == ttnn.FabricConfig.FABRIC_2D
++                ccl_axis = (1 if mesh_shape[0] == 1 else 0) if fabric_2d_line else None
++                num_links = (
++                    get_fabric_2d_line_num_links(self.mesh_device, self.tt_ccl, ccl_axis) if fabric_2d_line else 1
++                )
+                 all_gather_output = ttnn.experimental.all_gather_async(
+                     attn_output_cat,
+                     persistent_output_buffer=None,
+                     dim=3,
+-                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
+-                    num_links=1,
++                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(ccl_axis),
++                    num_links=num_links,
++                    cluster_axis=ccl_axis,
+                     topology=self.ccl_topology,
+                     memory_config=self.args.get_attn_all_gather_output_mem_config(Mode.DECODE, self.prefetcher),
+-                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+-                    chunks_per_sync=10,
+-                    num_workers_per_link=2,
+-                    num_buffers_per_channel=2,
++                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(ccl_axis),
++                    chunks_per_sync=None if fabric_2d_line else 10,
++                    num_workers_per_link=None if fabric_2d_line else 2,
++                    num_buffers_per_channel=None if fabric_2d_line else 2,
+                     subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+                 )
+                 dense_out_sharded = ttnn.linear(
+diff --git a/models/tt_transformers/tt/ccl.py b/models/tt_transformers/tt/ccl.py
+index 800d69a2edde6e60418d8feb5cddbe6fca7a75e0..e671019d472d1cd61e8affab6848177a61c3ee8c 100644
+--- a/models/tt_transformers/tt/ccl.py
++++ b/models/tt_transformers/tt/ccl.py
+@@ -30,6 +30,14 @@ def get_num_links(mesh_device, cluster_axis=None):
+     return get_common_num_links(mesh_device, cluster_axis)
+ 
+ 
++def get_fabric_2d_line_num_links(mesh_device, tt_ccl, cluster_axis):
++    """Return the line width without imposing Galaxy assumptions on other systems."""
++    if ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY:
++        # Link discovery on a Galaxy submesh currently falls back to one.
++        return 4
++    return tt_ccl.get_num_links(cluster_axis)
++
++
+ class TT_CCL:
+     def __init__(
+         self,
+@@ -147,16 +155,30 @@ def tt_all_reduce(
+     Returns:
+         The reduced tensor.
+     """
+-    # Skip CCL if single device or only 1 device on the target axis
++    # Skip CCL if single device or only 1 device on the target axis.
+     mesh_shape = list(mesh_device.shape)
+-    if mesh_shape == [1, 1] or (cluster_axis == 1 and 1 in list(mesh_device.shape)):
++    if mesh_shape == [1, 1] or (cluster_axis == 1 and 1 in mesh_shape):
+         return input_tensor
+ 
++    # The legacy T3K path uses cluster_axis=0 as an all-device selector even
++    # though a 1xN mesh's physical line is axis 1.  Keep the selector semantics
++    # above, but name the real line axis when launching FABRIC_2D CCL.
++    ccl_cluster_axis = cluster_axis
++    fabric_2d_line = False
++    if 1 in mesh_shape:
++        ccl_cluster_axis = 1 if mesh_shape[0] == 1 else 0
++        if ttnn.get_fabric_config() == ttnn.FabricConfig.FABRIC_2D:
++            fabric_2d_line = True
++            topology = ttnn.Topology.Linear
++
+     # Auto-detect num_links if not provided
+     if num_reduce_scatter_links is None:
+-        num_reduce_scatter_links = tt_ccl.get_num_links(cluster_axis)
++        num_reduce_scatter_links = tt_ccl.get_num_links(ccl_cluster_axis)
+     if num_all_gather_links is None:
+-        num_all_gather_links = tt_ccl.get_num_links(cluster_axis)
++        num_all_gather_links = tt_ccl.get_num_links(ccl_cluster_axis)
++    if fabric_2d_line:
++        num_reduce_scatter_links = get_fabric_2d_line_num_links(mesh_device, tt_ccl, ccl_cluster_axis)
++        num_all_gather_links = num_reduce_scatter_links
+ 
+     # Ensure dim 0 and 1 are 1
+     original_shape = input_tensor.shape
+@@ -176,15 +198,16 @@ def tt_all_reduce(
+             input_tensor,
+             persistent_output_buffers=None,
+             dim=dim,
+-            multi_device_global_semaphore=tt_ccl.get_and_cycle_rs_semaphore_handles(),
+-            barrier_semaphore=tt_ccl.get_and_cycle_barrier_semaphore_handle(),
++            multi_device_global_semaphore=tt_ccl.get_and_cycle_rs_semaphore_handles(ccl_cluster_axis),
++            barrier_semaphore=tt_ccl.get_and_cycle_barrier_semaphore_handle(ccl_cluster_axis),
+             num_links=num_reduce_scatter_links,
+             memory_config=memory_config,
+-            intermediate_memory_config=rs_memory_config,
++            intermediate_memory_config=None if fabric_2d_line else rs_memory_config,
+             topology=topology,
+-            chunks_per_sync=chunks_per_sync,
+-            num_workers_per_link=num_workers_per_link,
+-            num_buffers_per_channel=2,
++            cluster_axis=ccl_cluster_axis,
++            chunks_per_sync=None if fabric_2d_line else chunks_per_sync,
++            num_workers_per_link=None if fabric_2d_line else num_workers_per_link,
++            num_buffers_per_channel=None if fabric_2d_line else 2,
+             subdevice_id=subdevice_id,
+         )
+         input_tensor.deallocate(True)
+diff --git a/models/tt_transformers/tt/distributed_norm.py b/models/tt_transformers/tt/distributed_norm.py
+index 5ae551b280b3d342d0be929a338bf5262a5d1390..0f3c89d49f496aeb5d99102f3171ce073d8d7b92 100644
+--- a/models/tt_transformers/tt/distributed_norm.py
++++ b/models/tt_transformers/tt/distributed_norm.py
+@@ -4,7 +4,11 @@
+ 
+ import ttnn
+ from models.common.lightweightmodule import LightweightModule
+-from models.tt_transformers.tt.ccl import tt_distributed_rmsnorm, tt_sharded_distributed_rmsnorm
++from models.tt_transformers.tt.ccl import (
++    get_fabric_2d_line_num_links,
++    tt_distributed_rmsnorm,
++    tt_sharded_distributed_rmsnorm,
++)
+ from models.tt_transformers.tt.common import Mode
+ 
+ 
+@@ -55,6 +59,21 @@ class DistributedNorm(LightweightModule):
+         """Apply a norm, possibly gathering inputs if required."""
+ 
+         sharded_output_config = norm_config.get("sharded_output_config") if norm_config else None
++        ccl_axis = None
++        ccl_topology = self.args.ccl_topology()
++        ccl_chunks_per_sync = 10
++        ccl_num_workers_per_link = 2
++        ccl_num_buffers_per_channel = 2
++        mesh_shape = list(self.args.mesh_device.shape)
++        if 1 in mesh_shape and ttnn.get_fabric_config() == ttnn.FabricConfig.FABRIC_2D:
++            ccl_axis = 1 if mesh_shape[0] == 1 else 0
++            ccl_topology = ttnn.Topology.Linear
++            ccl_chunks_per_sync = None
++            ccl_num_workers_per_link = None
++            ccl_num_buffers_per_channel = None
++        ccl_num_links = (
++            get_fabric_2d_line_num_links(self.args.mesh_device, self.tt_ccl, ccl_axis) if ccl_axis is not None else None
++        )
+ 
+         if self.TG:
+             if mode == Mode.DECODE:
+@@ -86,20 +105,21 @@ class DistributedNorm(LightweightModule):
+                 x,
+                 persistent_output_buffer=None,
+                 dim=3,
+-                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
++                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(ccl_axis),
+                 num_links=self.args.model_config[self.ag_config_key]["num_links"]
+                 if self.ag_config_key and mode == "decode"
+-                else self.tt_ccl.get_num_links(1),
+-                topology=self.args.ccl_topology(),
++                else (ccl_num_links if ccl_axis is not None else self.tt_ccl.get_num_links(1)),
++                cluster_axis=ccl_axis,
++                topology=ccl_topology,
+                 memory_config=input_mem_cfg,
+-                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
++                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(ccl_axis),
+                 chunks_per_sync=self.args.model_config[self.ag_config_key]["chunks_per_sync"]
+                 if self.ag_config_key and mode == "decode"
+-                else 10,
++                else ccl_chunks_per_sync,
+                 num_workers_per_link=self.args.model_config[self.ag_config_key]["num_workers_per_link"]
+                 if self.ag_config_key and mode == "decode"
+-                else 2,
+-                num_buffers_per_channel=2,
++                else ccl_num_workers_per_link,
++                num_buffers_per_channel=ccl_num_buffers_per_channel,
+                 subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+             )
+         else:
+@@ -115,14 +135,15 @@ class DistributedNorm(LightweightModule):
+                 x,
+                 persistent_output_buffer=None,
+                 dim=3,
+-                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
+-                num_links=self.tt_ccl.get_num_links(1),
+-                topology=self.args.ccl_topology(),
++                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(ccl_axis),
++                num_links=ccl_num_links if ccl_axis is not None else self.tt_ccl.get_num_links(1),
++                cluster_axis=ccl_axis,
++                topology=ccl_topology,
+                 memory_config=x.memory_config(),
+-                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+-                chunks_per_sync=10,
+-                num_workers_per_link=2,
+-                num_buffers_per_channel=2,
++                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(ccl_axis),
++                chunks_per_sync=ccl_chunks_per_sync,
++                num_workers_per_link=ccl_num_workers_per_link,
++                num_buffers_per_channel=ccl_num_buffers_per_channel,
+             )
+ 
+         return x
+diff --git a/models/tt_transformers/tt/generator.py b/models/tt_transformers/tt/generator.py
+index 1f14a128fbeae88077dca82b1bfd91436fb067f4..4024736f1da20dc0797d6871416515b78cd949ad 100644
+--- a/models/tt_transformers/tt/generator.py
++++ b/models/tt_transformers/tt/generator.py
+@@ -40,6 +40,16 @@ from models.tt_transformers.tt.common import (
+ # Exceeding this triggers a fallback to sequential per-user prefill.
+ MAX_BATCHED_PREFILL_SEQ_LEN = 128 * 1024
+ 
++# The remainder a resumed prefill is left with. A resume starts on a block boundary, so the
++# remainder never exceeds one block, and get_padded_prefill_len rounds anything <= 128 up to 128 --
++# so warming this one length warms every resumed prefill regardless of prompt length.
++MIN_RESUMED_PREFILL_WARMUP_LEN = 128
++
++
++def _env_on(name: str) -> bool:
++    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
++
++
+ # Power-of-2 batch sizes supported by trace caching for batched prefill.
+ SUPPORTED_PREFILL_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
+ 
+@@ -205,6 +215,41 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
+                 if skip_sequence_lengths:
+                     break
+ 
++        # A prefill that resumes from cached KV compiles its own trace: the key carries "sp1"
++        # (num_cached_tokens > 0) while everything above warms "sp0". Without this the first
++        # cache hit of the process pays that compile -- ~0.5 s on Qwen3-32B, which lands on the
++        # first user request and reads as the KV cache being slow when it is not.
++        #
++        # One length covers every hit. A resumed prefill starts on a block boundary, so its
++        # remainder is at most one block and get_padded_prefill_len() rounds anything <=128 up
++        # to 128 -- ISL 900, 3296 and 5000 all warm the same trace.
++        #
++        # Off by default: it costs one more captured trace out of trace_region_size, and a
++        # deployment that never resumes from cached KV would pay that for nothing.
++        if enable_trace and _env_on("TT_WARMUP_PREFILL_RESUMED"):
++            resumed_len = next((n for n in sequence_lengths_to_warmup if n > MIN_RESUMED_PREFILL_WARMUP_LEN), None)
++            if resumed_len is None:
++                logger.info("Skipping resumed-prefill warmup: no warmup length exceeds one block")
++            else:
++                for model_id in range(self.data_parallel):
++                    warmup_args = self._mock_tokens(1, resumed_len, kv_cache, model_id)
++                    if warmup_args["page_table"] is None:
++                        logger.info("Skipping resumed-prefill warmup: needs paged attention")
++                        break
++                    cached = resumed_len - MIN_RESUMED_PREFILL_WARMUP_LEN
++                    logger.info(
++                        f"Warming up prefill resumed from cached KV: seq_len={resumed_len} "
++                        f"cached={cached} (remainder {MIN_RESUMED_PREFILL_WARMUP_LEN})"
++                    )
++                    self.prefill_forward_text(
++                        **warmup_args,
++                        kv_cache=kv_cache,
++                        enable_trace=enable_trace,
++                        model_id_warmup=model_id,
++                        sampling_params=None,
++                        start_pos=[cached],
++                    )
++
+         # Vision compile for multimodal models
+         if getattr(self.model_args[0], "is_multimodal", False):
+             vision_chunk_size = getattr(self.model_args[0], "vision_chunk_size", 896)
+@@ -2810,9 +2855,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
+                 page_table = torch.cat([page_table, padding], dim=1)
+             return page_table[:, :num_blocks]
+ 
+-    ## Destructor
+-
+-    def __del__(self):
++    def release_traces(self):
+         # Release all captured traces to prevent nanobind memory leaks
+         # Traces must be released before closing the mesh device
+         try:
+@@ -2864,6 +2907,26 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
+         except Exception:
+             pass  # Ignore any errors during trace cleanup
+ 
++        # Explicit worker shutdown and __del__ can both reach this cleanup.
++        # Clear the handles so releasing traces remains idempotent.
++        for trace_attr in (
++            "trace_id_prefill",
++            "trace_id_prefill_sampling",
++            "trace_ids_decode",
++            "trace_ids",
++        ):
++            if hasattr(self, trace_attr):
++                setattr(self, trace_attr, {})
++
++    def modules(self):
++        """Provide the minimal nn.Module traversal contract used by vLLM cleanup."""
++        return ()
++
++    ## Destructor
++
++    def __del__(self):
++        self.release_traces()
++
+         # Workaround for issue #19052
+         if self.data_parallel > 1:
+             for m in self.model:
+diff --git a/models/tt_transformers/tt/model.py b/models/tt_transformers/tt/model.py
+index 657ab4ee4eb0e40f92bdfdb75470d59656cda1d9..6891996e04c97899158961a59ff627c8584929a7 100644
+--- a/models/tt_transformers/tt/model.py
++++ b/models/tt_transformers/tt/model.py
+@@ -10,7 +10,7 @@ import ttnn
+ from models.common.lightweightmodule import LightweightModule
+ from models.common.rmsnorm import RMSNorm
+ from models.common.sampling.generator import SamplingGenerator
+-from models.tt_transformers.tt.ccl import TT_CCL
++from models.tt_transformers.tt.ccl import TT_CCL, get_fabric_2d_line_num_links
+ from models.tt_transformers.tt.common import Mode, copy_host_to_device
+ from models.tt_transformers.tt.decoder import TransformerBlock
+ from models.tt_transformers.tt.distributed_norm import DistributedNorm
+@@ -817,8 +817,14 @@ class Transformer(LightweightModule):
+ 
+         # Gather the output across all devices and untilize the tensor (for argmax)
+         if self.args.num_devices > 1:
+-            cluster_axis = 0 if self.args.is_galaxy else None
+-            num_links = 2 if self.args.is_galaxy else 1
++            mesh_shape = list(self.mesh_device.shape)
++            fabric_2d_line = 1 in mesh_shape and ttnn.get_fabric_config() == ttnn.FabricConfig.FABRIC_2D
++            cluster_axis = (1 if mesh_shape[0] == 1 else 0) if fabric_2d_line else (0 if self.args.is_galaxy else None)
++            num_links = (
++                get_fabric_2d_line_num_links(self.mesh_device, self.tt_ccl, cluster_axis)
++                if fabric_2d_line
++                else (2 if self.args.is_galaxy else 1)
++            )
+             tt_logits = ttnn.experimental.all_gather_async(
+                 tt_logits,
+                 persistent_output_buffer=None,
+@@ -829,9 +835,9 @@ class Transformer(LightweightModule):
+                 cluster_axis=cluster_axis,
+                 topology=self.args.ccl_topology(),
+                 barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
+-                chunks_per_sync=10,
+-                num_workers_per_link=2,
+-                num_buffers_per_channel=2,
++                chunks_per_sync=None if fabric_2d_line else 10,
++                num_workers_per_link=None if fabric_2d_line else 2,
++                num_buffers_per_channel=None if fabric_2d_line else 2,
+                 subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+             )
+ 
+diff --git a/models/tt_transformers/tt/model_config.py b/models/tt_transformers/tt/model_config.py
+index 9285707a85295a8152769a430dacbdbd533cbd3a..14624f1f6127bf04372c5f6de9200e1767c5ddf4 100644
+--- a/models/tt_transformers/tt/model_config.py
++++ b/models/tt_transformers/tt/model_config.py
+@@ -2512,6 +2512,15 @@ class ModelArgs:
+         return False
+ 
+     def ccl_topology(self):
++        # A degenerate 1xN/Nx1 model submesh can run over a full-system 2D
++        # fabric, but its model collective is a line rather than a ring.
++        if (
++            self.mesh_device is not None
++            and 1 in list(self.mesh_device.shape)
++            and ttnn.get_fabric_config() == ttnn.FabricConfig.FABRIC_2D
++        ):
++            return ttnn.Topology.Linear
++
+         # Use ring on a T3K or 6U galaxy or P300x2 or P150x4/8 submesh
+         if ttnn.cluster.get_cluster_type() in [
+             ttnn.cluster.ClusterType.P300_X2,

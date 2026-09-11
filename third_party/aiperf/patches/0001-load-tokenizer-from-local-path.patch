@@ -1,0 +1,19 @@
+diff --git a/src/aiperf/common/tokenizer.py b/src/aiperf/common/tokenizer.py
+index 462b0f575bfe2c3126bf87c81651046f3057621d..6f770988c28e1a2bf75707bd707352ef32e74973 100644
+--- a/src/aiperf/common/tokenizer.py
++++ b/src/aiperf/common/tokenizer.py
+@@ -531,3 +531,13 @@ class Tokenizer:
+         _ensure_deepseek_v32_config_registered()
+-
++        local_path = Path(name).expanduser()
++        if local_path.exists():
++            return cls._build_with_kwargs(
++                AutoTokenizer.from_pretrained(
++                    str(local_path),
++                    trust_remote_code=trust_remote_code,
++                    local_files_only=True,
++                ),
++                resolved_name=str(local_path),
++            )
++
+         if _is_offline_mode():

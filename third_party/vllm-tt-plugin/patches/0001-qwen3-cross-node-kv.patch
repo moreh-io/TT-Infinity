@@ -1,0 +1,533 @@
+diff --git a/examples/offline_inference_tt.py b/examples/offline_inference_tt.py
+index a3220c9..4126cb9 100644
+--- a/examples/offline_inference_tt.py
++++ b/examples/offline_inference_tt.py
+@@ -19,7 +19,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
+ from vllm.entrypoints.openai.api_server import (
+     build_async_engine_client_from_engine_args,
+ )
+-from vllm.inputs.data import TokensPrompt
++from vllm.inputs import TokensPrompt
+ from vllm.utils.async_utils import merge_async_iterators
+ from vllm.v1.engine.async_llm import AsyncLLM
+ 
+@@ -433,12 +433,27 @@ def run_inference(
+     # Create and run LLM
+     if not async_engine:
+         llm = LLM(**engine_kw_args)
+-        if not measure_perf:
+-            generate_tokens(llm, prompts, sampling_params, print_output=True)
+-        else:
+-            max_model_len = llm.llm_engine.model_config.max_model_len
+-            check_valid_perf_prompt_len(max_model_len, perf_prompt_len, sampling_params)
+-            run_inference_perf(llm, prompts, sampling_params)
++        try:
++            if not measure_perf:
++                generate_tokens(llm, prompts, sampling_params, print_output=True)
++            else:
++                max_model_len = llm.llm_engine.model_config.max_model_len
++                check_valid_perf_prompt_len(
++                    max_model_len, perf_prompt_len, sampling_params
++                )
++                run_inference_perf(llm, prompts, sampling_params)
++        finally:
++            # The in-process TT executor owns live devices and profiler threads.
++            # Tear them down before Python interpreter finalization.
++            try:
++                llm.llm_engine.engine_core.shutdown()
++            except RuntimeError as err:
++                # vLLM's generic cleanup calls torch.accelerator.empty_cache(),
++                # but a TT-only process has no PyTorch accelerator allocator.
++                if "Cannot access accelerator device when none is available" not in str(
++                    err
++                ):
++                    raise
+     else:
+         print("Using async engine")
+         engine_args = AsyncEngineArgs(**engine_kw_args)
+diff --git a/src/vllm_tt_plugin/lane_scheduler.py b/src/vllm_tt_plugin/lane_scheduler.py
+index 68fab03..e725c91 100644
+--- a/src/vllm_tt_plugin/lane_scheduler.py
++++ b/src/vllm_tt_plugin/lane_scheduler.py
+@@ -707,4 +707,6 @@ class TTLaneCoordinator(SchedulerInterface):
+             sched.shutdown()
+ 
+     def get_kv_connector(self) -> KVConnectorBase_V1 | None:
+-        return None
++        # Lanes are full vLLM schedulers and own the scheduler-side connector; expose lane 0's
++        # so the engine core sees it (KV transfer with lanes is otherwise unsupported).
++        return self.lanes[0].connector if self.lanes else None
+diff --git a/src/vllm_tt_plugin/model_runner.py b/src/vllm_tt_plugin/model_runner.py
+index 4c79842..a87a9a5 100644
+--- a/src/vllm_tt_plugin/model_runner.py
++++ b/src/vllm_tt_plugin/model_runner.py
+@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
+     UniformTypeKVCacheSpecs,
+ )
+ from vllm.v1.outputs import (
++    KVConnectorOutput,
+     EMPTY_MODEL_RUNNER_OUTPUT,
+     LogprobsLists,
+     LogprobsTensors,
+@@ -2107,6 +2108,8 @@ class TTModelRunner:
+         model_input = self.build_model_input(scheduler_output, None)
+         if model_input is None:
+             return EMPTY_MODEL_RUNNER_OUTPUT
++        self._t3knic_step_begin(scheduler_output)
++        model_input = self._t3knic_align_prefill_start(model_input)
+ 
+         is_decode = model_input.prompt_lens is None
+         if self.non_dp_async_scheduling and is_decode:
+@@ -2210,6 +2213,7 @@ class TTModelRunner:
+             ),
+         )
+         sampled_token_ids_per_dp, logprobs_per_dp = self._sample_sync_forward(fwd)
++        self._t3knic_step_end()
+         sampled_token_ids = sampled_token_ids_per_dp[0]
+         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
+         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
+@@ -2813,6 +2817,101 @@ class TTModelRunner:
+         ]
+         logits.masked_fill_(unpacked_bitmask, -float("inf"))
+ 
++    # --- moreh-t3knic: KV connector lifecycle around one forward step -----------------------
++    # Mirrors vLLM's KVConnectorModelRunnerMixin for the TT runner. First cut: load/save hooks
++    # on the synchronous (prefill) path; async decode steps only bind/clear metadata.
++    def _t3knic_connector(self):
++        from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
++
++        return get_kv_transfer_group() if has_kv_transfer_group() else None
++
++    def _t3knic_align_prefill_start(self, model_input):
++        """Floor each prefill's cached-prefix length to a KV block boundary.
++
++        tt_transformers' prefix-caching prefill takes the chunk's page table as
++        ``page_table[:, num_cached_tokens // block_size : ...]`` and then has
++        ``paged_fill_cache`` write the recomputed window at OFFSET 0 of that block, so it
++        is only correct when ``num_cached_tokens`` is a multiple of block_size.
++
++        A KV connector can hand us a mid-block value: LMCache reports a full hit and then
++        drops one token so the engine still computes something (3296 -> 3295 at block_size
++        128). The window is then written 95 tokens early and overwrites the whole last
++        block of restored KV -- a byte-perfect restore that still decodes to garbage.
++
++        Flooring makes the model recompute the partial block (96 tokens here) from the
++        cached prefix, which is what an ordinary chunked prefill does. vLLM's accounting is
++        untouched: only the model's start position moves, and the extra tokens rewrite the
++        same KV values. Set T3KNIC_ALIGN_PREFILL=0 to disable.
++        """
++        import os
++
++        if model_input is None or model_input.prompt_lens is None:
++            return model_input  # decode step
++        if os.environ.get("T3KNIC_ALIGN_PREFILL", "1").strip().lower() in ("0", "false", "no", "off"):
++            return model_input
++        try:
++            positions = model_input.input_positions
++            # Prefill positions arrive as a NUMPY array (num_computed_tokens_cpu), decode as a
++            # torch tensor -- len() and the arithmetic below work on both.
++            if positions is None or len(positions) == 0:
++                return model_input
++            block = int(getattr(self, "block_size", 0) or 0)
++            if block <= 0:
++                block = int(self.cache_config.block_size)
++            if block <= 0:
++                return model_input
++            misaligned = (positions % block) != 0
++            if not bool(misaligned.any()):
++                return model_input
++            aligned = (positions // block) * block
++            logger.info(
++                "[t3knic] prefill start floored to the %d-token block boundary: %s -> %s",
++                block,
++                positions[misaligned].tolist(),
++                aligned[misaligned].tolist(),
++            )
++            # TTModelInput is a frozen dataclass: rebuild rather than assign.
++            import dataclasses
++
++            return dataclasses.replace(model_input, input_positions=aligned)
++        except Exception as exc:  # noqa: BLE001 - never block a forward on this
++            logger.warning("[t3knic] prefill-start alignment skipped (%s)", exc)
++        return model_input
++
++    def _t3knic_step_begin(self, scheduler_output) -> None:
++        connector = self._t3knic_connector()
++        if connector is None:
++            return
++        self._t3knic_pending_finished = set(scheduler_output.finished_req_ids or ())
++        connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
++        # LMCache's start_load_kv only None-checks forward_context.attn_metadata (None = skip the
++        # load, as vLLM does for dummy runs); the TT runner has no vLLM ForwardContext, so hand it
++        # the same stand-in the moreh worker glue uses. KV caches were registered at bind time.
++        from types import SimpleNamespace
++
++        connector.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
++        for layer_name in getattr(self, "_t3knic_layer_names", ()):
++            connector.wait_for_layer_load(layer_name)
++
++    def _t3knic_step_end(self) -> None:
++        connector = self._t3knic_connector()
++        if connector is None:
++            return
++        connector.wait_for_save()
++        finished_sending, finished_recving = connector.get_finished(
++            getattr(self, "_t3knic_pending_finished", set())
++        )
++        connector.clear_connector_metadata()
++        if finished_sending or finished_recving:
++            self._t3knic_kv_output = KVConnectorOutput(
++                finished_sending=finished_sending, finished_recving=finished_recving
++            )
++
++    def _t3knic_take_kv_output(self):
++        out = getattr(self, "_t3knic_kv_output", None)
++        self._t3knic_kv_output = None
++        return out
++
+     def _build_runner_output(
+         self,
+         sampled_token_ids: torch.Tensor,
+@@ -2848,6 +2947,7 @@ class TTModelRunner:
+         ]
+ 
+         return ModelRunnerOutput(
++            kv_connector_output=self._t3knic_take_kv_output(),
+             req_ids=output_req_ids,
+             req_id_to_index=output_req_id_to_index,
+             sampled_token_ids=sampled_token_id_lists,
+diff --git a/src/vllm_tt_plugin/worker.py b/src/vllm_tt_plugin/worker.py
+index 5ca4c07..35e3087 100644
+--- a/src/vllm_tt_plugin/worker.py
++++ b/src/vllm_tt_plugin/worker.py
+@@ -58,6 +58,10 @@ if TYPE_CHECKING:
+ 
+ logger = init_tt_logger(__name__)
+ 
++# Keep the full Galaxy mesh alive when a model runs on a submesh.  The parent
++# owns the 32-chip FABRIC_2D control plane used by traffic to external gateways.
++_fabric_parent_meshes = {}
++
+ # Ensure TT model architectures are registered in this process as early as
+ # possible. `WorkerWrapperBase.init_worker` imports the worker class module
+ # before initializing multimodal caches; without this, early architecture
+@@ -299,12 +303,41 @@ class TTWorker(WorkerBase):
+         self.cache_config.num_gpu_blocks_override = num_tt_blocks
+         return 1 << 64
+ 
++    def get_kv_connector_handshake_metadata(self):
++        """Same contract as vllm's GPUWorker: {(pp_rank, tp_rank): metadata} or None.
++
++        The engine core RPCs this on every worker after KV-cache init when a kv_transfer_config
++        is set; WorkerBase has no default, so the TT worker must provide it.
++        """
++        from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
++
++        if not has_kv_transfer_group():
++            return None
++        connector = get_kv_transfer_group()
++        metadata = connector.get_handshake_metadata()
++        if metadata is None:
++            return None
++        from vllm.distributed.parallel_state import get_pp_group, get_tp_group
++
++        return {(get_pp_group().rank_in_group, get_tp_group().rank_in_group): metadata}
++
+     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+         """Allocate TT KV cache (only DP rank 0) and initialize persistent
+         input batch (all DP ranks) with the specified kv_cache_config.
+         """
+         _validate_tt_kv_cache_capacity(self.vllm_config, kv_cache_config)
++        # NB(moreh-t3knic): connectors exposing attach_mesh_device (T3knicKVConnector) get the
++        # model submesh + the 32-chip parent BEFORE the KV caches are bound, then the bound TT
++        # handles are handed over (bind_tt_cache). No-op without a kv_transfer_config.
++        if self.vllm_config.kv_transfer_config is not None and self.mesh_device is not None:
++            from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
++
++            _t3knic_ensure_distributed_env(self)
++            ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
++            _t3knic_attach_connector(self, kv_cache_config)
+         self.model_runner.initialize_kv_cache(kv_cache_config)
++        if self.vllm_config.kv_transfer_config is not None and self.mesh_device is not None:
++            _t3knic_bind_kv_caches(self, kv_cache_config)
+ 
+     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
+         # Cache is already initialized in initialize_from_config.
+@@ -500,17 +533,53 @@ class TTWorker(WorkerBase):
+             req_id_to_index=req_id_to_index,
+         )
+ 
+-    # ---- Destructor (used to close devices) ----
++    def shutdown(self) -> None:
++        """Release model state and TT devices before interpreter teardown."""
++        # The connector owns ttnn Clients whose DETACH requests use this worker's
++        # mesh command queue.  vLLM normally shuts the global connector down after
++        # worker teardown, which is too late for TT: close_mesh_device has already
++        # destroyed that queue.  The helper is idempotent and clears the global, so
++        # the later EngineCore cleanup becomes a no-op.
++        from vllm.distributed.kv_transfer import (
++            ensure_kv_transfer_shutdown,
++            has_kv_transfer_group,
++        )
++
++        # Keep a direct reference to the connector that was attached to this worker's TT mesh.
++        # EngineCore can clear the process-global connector before Worker.shutdown() runs; relying
++        # only on that global then skips the KVM Clients' DETACH requests and tears the mesh down
++        # under live fabric workers.  Close the attached object explicitly while its CQ is alive.
++        attached_connector = getattr(self, "_t3knic_attached_connector", None)
++        if attached_connector is not None:
++            logger.info("[t3knic][cleanup] closing mesh-attached KV connector")
++            attached_connector.shutdown()
++            self._t3knic_attached_connector = None
++            logger.info("[t3knic][cleanup] mesh-attached KV connector closed")
++
++        # Clear/shut down the global agent as well. T3knicKVConnector.shutdown() is idempotent, so
++        # this is safe when the global still names the same object closed immediately above.
++        if has_kv_transfer_group():
++            ensure_kv_transfer_shutdown()
++
++        model_runner = getattr(self, "model_runner", None)
++        model = getattr(model_runner, "model", None)
++        release_traces = getattr(model, "release_traces", None)
++        if release_traces is not None:
++            release_traces()
+ 
+-    def __del__(self):
+-        # Delete model runner first in case there are model artifacts
+         with suppress(AttributeError):
+-            # attributes may be already torn down when destructor is called
+             del self.model_runner
+ 
+-            if self.mesh_device:
+-                close_mesh_device(self.mesh_device, get_tt_config(self.vllm_config))
+-                del self.mesh_device
++        mesh_device = getattr(self, "mesh_device", None)
++        if mesh_device is not None:
++            self.mesh_device = None
++            close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
++
++    # Keep destructor cleanup as a fallback for callers that do not invoke the
++    # vLLM worker lifecycle explicitly.
++    def __del__(self):
++        with suppress(Exception):
++            self.shutdown()
+ 
+         if hasattr(super(), "__del__"):
+             super().__del__()  # type: ignore
+@@ -786,8 +855,38 @@ def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
+ 
+     device_params = device_params_from_tt_config(tt_config, trace_mode)
+ 
+-    # Set fabric before opening the device
++    # A FABRIC_2D Galaxy model submesh still needs routers running on all 32
++    # chips.  Open the physical 8x4 parent first, then hand one requested
++    # submesh to the model while retaining the parent for routing/ownership.
+     num_devices_requested = mesh_grid[0] * mesh_grid[1]
++    fabric_config = get_fabric_config(tt_config, num_devices_requested)
++    use_galaxy_parent = (
++        fabric_config == ttnn.FabricConfig.FABRIC_2D
++        and ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
++        and ttnn.get_num_devices() == 32
++        and num_devices_requested < 32
++    )
++
++    if use_galaxy_parent:
++        set_fabric(tt_config, 32)
++        _t3knic_apply_intermesh_fabric()
++        parent_mesh = ttnn.open_mesh_device(
++            ttnn.MeshShape(8, 4),
++            dispatch_core_config=get_dispatch_core_config(tt_config),
++            **device_params,
++        )
++        if mesh_grid == (1, 8):
++            parent_mesh.reshape(ttnn.MeshShape(4, 8))
++        submeshes = parent_mesh.create_submeshes(ttnn.MeshShape(*mesh_grid))
++        mesh_device = submeshes[0]
++        _fabric_parent_meshes[id(mesh_device)] = parent_mesh
++        logger.info(
++            "32-device FABRIC_2D parent is created; model submesh grid %s uses %d devices",
++            mesh_grid,
++            mesh_device.get_num_devices(),
++        )
++        return mesh_device
++
+     set_fabric(tt_config, num_devices_requested)
+ 
+     mesh_device = ttnn.open_mesh_device(
+@@ -807,6 +906,15 @@ def close_mesh_device(mesh_device, tt_config):
+     # Read device profiler (no-op if not profiling with tracy)
+     ttnn.ReadDeviceProfiler(mesh_device)
+ 
++    parent_mesh = _fabric_parent_meshes.pop(id(mesh_device), None)
++    if parent_mesh is not None:
++        num_devices = parent_mesh.get_num_devices()
++        for submesh in parent_mesh.get_submeshes():
++            ttnn.close_mesh_device(submesh)
++        ttnn.close_mesh_device(parent_mesh)
++        reset_fabric(tt_config, num_devices)
++        return
++
+     # Close devices
+     num_devices = mesh_device.get_num_devices()
+     for submesh in mesh_device.get_submeshes():
+@@ -815,3 +923,160 @@ def close_mesh_device(mesh_device, tt_config):
+ 
+     # Reset fabric
+     reset_fabric(tt_config, num_devices)
++
++
++# --- moreh-t3knic: cross-node KV (Galaxy <-> T3K) glue -----------------------------------------
++def _t3knic_apply_intermesh_fabric() -> None:
++    """Select the static inter-mesh fabric (uniform router config) before the parent opens.
++
++    Only active when T3KNIC_INTERMESH_ROLE is set; must run AFTER set_fabric (which would
++    otherwise drop the router config) and BEFORE ttnn.open_mesh_device.
++    """
++    role = os.environ.get("T3KNIC_INTERMESH_ROLE", "").strip()
++    try:
++        from lmcache_t3knic.t3knic_lmcache import intermesh
++    except ImportError:
++        # Not installed is fine -- single-node runs never set the role. But if the operator asked
++        # for the cross-node path, skipping this silently means the parent mesh opens without the
++        # inter-mesh router config and dies minutes later on an Ethernet heartbeat that names
++        # nothing. Say what actually went wrong instead.
++        if role:
++            raise RuntimeError(
++                f"T3KNIC_INTERMESH_ROLE={role} is set but lmcache_t3knic is not importable; "
++                "put the checkout's lmcache-t3knic on PYTHONPATH"
++            )
++        return
++    if intermesh.role_from_env() != "galaxy":
++        return
++    logger.info("[t3knic][intermesh] role=galaxy rank ready; gateway_visible=%s", intermesh.gateway_visible("galaxy"))
++    intermesh.apply_fabric_config("galaxy")
++
++
++def get_fabric_parent_mesh(mesh_device):
++    """The 32-chip FABRIC_2D parent kept alive for a model submesh, or None."""
++    return _fabric_parent_meshes.get(id(mesh_device))
++
++
++def _t3knic_attach_connector(worker, kv_cache_config) -> None:
++    from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
++
++    if not has_kv_transfer_group():
++        return
++    connector = get_kv_transfer_group()
++    if not hasattr(connector, "attach_mesh_device"):
++        return
++    mesh = worker.mesh_device
++    ndev = mesh.get_num_devices()
++    # One replica per process on this path: the whole submesh is the TP group (axis 1 of a 1xN).
++    dp_size, tp_size, dp_axis, tp_axis = 1, ndev, 0, 1
++    blocks_per_dp = getattr(kv_cache_config, "num_blocks", None)
++    parent = get_fabric_parent_mesh(mesh)
++    logger.info(
++        "[t3knic] attach geometry: ndev=%s dp_size=%s tp_size=%s blocks_per_dp=%s parent=%s",
++        ndev, dp_size, tp_size, blocks_per_dp, "32-chip parent" if parent is not None else None,
++    )
++    connector.attach_mesh_device(
++        mesh,
++        None,
++        None,
++        dp_size=dp_size,
++        tp_size=tp_size,
++        dp_axis=dp_axis,
++        tp_axis=tp_axis,
++        blocks_per_dp=blocks_per_dp,
++        parent_mesh=parent,
++        wire_stage_coord=None,
++        wire_mode=os.environ.get("T3KNIC_WIRE_MODE"),
++    )
++    # Do not depend on vLLM's process-global connector surviving until TTWorker.shutdown().
++    # This reference owns only lifecycle ordering; the connector remains globally registered for
++    # normal request processing.
++    worker._t3knic_attached_connector = connector
++
++
++def _t3knic_bind_kv_caches(worker, kv_cache_config) -> None:
++    """Hand the allocated TT KV tensors to the connector (bind_tt_cache contract)."""
++    from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
++
++    if not has_kv_transfer_group():
++        return
++    connector = get_kv_transfer_group()
++    if not hasattr(connector, "bind_tt_cache"):
++        return
++    runner = worker.model_runner
++    kv_caches = getattr(runner, "kv_caches", None)
++    if not kv_caches:
++        return
++    per_layer = kv_caches[0]  # [submesh][layer] -> [k_tt, v_tt]
++    # The plugin publishes stock vLLM specs (the legacy path even a single synthetic {"foo": spec});
++    # the connector's bind contract wants moreh-style per-owner specs. Build them from the allocated
++    # TT tensors instead of guessing the layout (see t3knic_lmcache.tt_plugin_kv_spec).
++    from lmcache_t3knic.t3knic_lmcache.tt_plugin_kv_spec import build_plugin_kv_specs
++
++    block_size = int(worker.cache_config.block_size)
++    layer_names, specs, handles = build_plugin_kv_specs(per_layer, block_size)
++    first = specs[layer_names[0]]
++    logger.info(
++        "[t3knic] plugin KV spec: %d layers, per-device block shape %s, dtype %s, %d B/block/chip (k+v)",
++        len(layer_names), tuple(first.get_cache_tensor_specs(1)[0].shape), first.get_cache_tensor_specs(1)[0].dtype,
++        first.page_size_bytes,
++    )
++    mesh = worker.mesh_device
++    connector.bind_tt_cache(
++        cache_specs=specs,
++        handles=handles,
++        global_worker_rank=0,
++        devices=tuple(int(d) for d in mesh.get_device_ids()),
++        mesh_shape=tuple(int(x) for x in mesh.shape),
++        tp_axis=1,
++        dp_axis=0,
++        num_blocks=int(kv_cache_config.num_blocks),
++        cp_size=1,
++        block_interleave=1,
++    )
++    runner._t3knic_layer_names = layer_names
++    logger.info("[t3knic] bound %d KV layers to the connector", len(layer_names))
++
++
++def _t3knic_ensure_distributed_env(worker) -> None:
++    """vLLM's KV-transfer init needs the TP group; the TT worker runs one process per model and
++    never initializes torch.distributed. Bring up a 1-rank world (gloo) + TP=1/PP=1 groups, the same
++    way the moreh worker does, unless someone already did."""
++    from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
++    from vllm.distributed import parallel_state
++
++    try:
++        parallel_state.get_tp_group()
++        return  # already initialized
++    except AssertionError:
++        pass
++    pc = worker.parallel_config
++    # GroupCoordinator builds torch.device(f"{platform.device_name}:{idx}") for out-of-tree
++    # platforms and "tt" is not a torch device type; the groups only need a gloo backend here (no
++    # device communicator at world_size 1), so present "cpu" to it for the duration of the init.
++    from vllm.platforms import current_platform
++
++    saved_device_name = getattr(current_platform, "device_name", None)
++    try:
++        if saved_device_name not in (None, "cpu", "cuda"):
++            current_platform.device_name = "cpu"
++        if getattr(parallel_state, "_WORLD", None) is None:
++            try:
++                from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
++            except ImportError:  # older layout
++                from vllm.utils import get_distributed_init_method, get_ip, get_open_port
++            init_distributed_environment(
++                world_size=int(getattr(pc, "world_size", 1) or 1),
++                rank=int(getattr(pc, "rank", 0) or 0),
++                distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
++                local_rank=0,
++                backend="gloo",
++            )
++        ensure_model_parallel_initialized(
++            int(getattr(pc, "tensor_parallel_size", 1) or 1),
++            int(getattr(pc, "pipeline_parallel_size", 1) or 1),
++        )
++    finally:
++        if saved_device_name not in (None, "cpu", "cuda"):
++            current_platform.device_name = saved_device_name
++    logger.info("[t3knic] initialized a %d-rank distributed env for KV transfer", int(getattr(pc, "world_size", 1) or 1))

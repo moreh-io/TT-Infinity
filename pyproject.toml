@@ -1,0 +1,29 @@
+[build-system]
+requires = ["scikit-build-core>=0.11,<0.12", "nanobind==2.12.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "kvcache-manager"
+version = "0.1.0"
+description = "TT-Infinity lifecycle bindings for the Fabric KV-cache runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.scikit-build]
+wheel.packages = []
+build.targets = ["kvcache_manager_python"]
+install.components = ["python"]
+cmake.build-type = "Release"
+
+[tool.scikit-build.cmake.define]
+KVCACHE_MANAGER_BUILD_PYTHON_BINDINGS = "ON"
+BUILD_TESTING = "OFF"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-m 'not device'"
+markers = ["device: requires Tenstorrent hardware and the host device lock"]

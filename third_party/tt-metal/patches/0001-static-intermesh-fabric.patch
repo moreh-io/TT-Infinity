@@ -1,0 +1,2732 @@
+diff --git a/tests/tt_metal/tt_fabric/custom_mesh_descriptors/t3k_galaxy_link1_mesh_graph_descriptor.textproto b/tests/tt_metal/tt_fabric/custom_mesh_descriptors/t3k_galaxy_link1_mesh_graph_descriptor.textproto
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec7dd7091e749a1595556bc91ca9650fc3b12020
+--- /dev/null
++++ b/tests/tt_metal/tt_fabric/custom_mesh_descriptors/t3k_galaxy_link1_mesh_graph_descriptor.textproto
+@@ -0,0 +1,34 @@
++# T3K <-> Galaxy link-1 benchmark topology.
++# Mesh 0 is the 4x8 Galaxy and mesh 1 is the 2x4 T3K.  Only the directly
++# connected endpoint pair participates in the inter-mesh connection.
++
++mesh_descriptors {
++  name: "GALAXY"
++  arch: WORMHOLE_B0
++  device_topology { dims: [ 4, 8 ] }
++  host_topology { dims: [ 1, 1 ] }
++  channels { count: 2 policy: RELAXED }
++}
++
++mesh_descriptors {
++  name: "T3K"
++  arch: WORMHOLE_B0
++  device_topology { dims: [ 2, 4 ] }
++  host_topology { dims: [ 1, 1 ] }
++  channels { count: 2 policy: RELAXED }
++}
++
++graph_descriptors {
++  name: "T3K_GALAXY_LINK1"
++  type: "FABRIC"
++  instances { mesh { mesh_descriptor: "GALAXY" mesh_id: 0 } }
++  instances { mesh { mesh_descriptor: "T3K" mesh_id: 1 } }
++
++  connections {
++    nodes { mesh { mesh_descriptor: "GALAXY" mesh_id: 0 device_id: 24 } }
++    nodes { mesh { mesh_descriptor: "T3K" mesh_id: 1 device_id: 1 } }
++    channels { count: 2 policy: RELAXED }
++  }
++}
++
++top_level_instance { graph { graph_descriptor: "T3K_GALAXY_LINK1" graph_id: 0 } }
+diff --git a/tt_metal/api/tt-metalium/experimental/fabric/control_plane.hpp b/tt_metal/api/tt-metalium/experimental/fabric/control_plane.hpp
+index 664385e449b2e244602078b8a7d2ca7e6e867f34..020ca650f480785c4afd1c88ed638102c968fe72 100644
+--- a/tt_metal/api/tt-metalium/experimental/fabric/control_plane.hpp
++++ b/tt_metal/api/tt-metalium/experimental/fabric/control_plane.hpp
+@@ -28,9 +28,9 @@ class Cluster;
+ struct EthCoord;
+ 
+ namespace umd {
+-    class Cluster;
+-    class ClusterDescriptor;
+-}
++class Cluster;
++class ClusterDescriptor;
++}  // namespace umd
+ 
+ namespace llrt {
+ class RunTimeOptions;
+@@ -257,6 +257,12 @@ public:
+     // Check if the provided chip and channel is a cross-host eth link
+     bool is_cross_host_eth_link(ChipId chip_id, chan_id_t chan_id) const;
+ 
++    // Resolve a zero-based link index to one of the live cross-host Ethernet
++    // channels on the configured static inter-mesh endpoint chip.
++    chan_id_t get_static_intermesh_endpoint_eth_channel() const;
++    chan_id_t get_static_intermesh_endpoint_eth_channel(uint32_t lane) const;
++    bool is_static_intermesh_endpoint_eth_channel(chan_id_t channel) const;
++
+     // Returns set of logical active ethernet coordinates on chip
+     // If skip_reserved_cores is true, will return cores that dispatch is not using,
+     // intended for users to grab available eth cores for testing
+@@ -445,7 +451,8 @@ private:
+         tt::tt_fabric::fabric_connection_info_t& dispatcher_connection_info,
+         tt::tt_fabric::fabric_connection_info_t& tensix_connection_info,
+         ChipId physical_chip_id,
+-        chan_id_t eth_channel_id) const;
++        chan_id_t eth_channel_id,
++        eth_chan_directions router_direction) const;
+ 
+     // UDM-specific helper to write per-worker connection info to each worker core's L1
+     void write_udm_fabric_connections_to_tensix_cores(
+diff --git a/tt_metal/api/tt-metalium/experimental/fabric/fabric.hpp b/tt_metal/api/tt-metalium/experimental/fabric/fabric.hpp
+index ab55a6ec14d0ecb253f4eb963a19d56ea1e1b01d..4db615cbc69bb21d1b1ae6d21dd4d2557dc52f7f 100644
+--- a/tt_metal/api/tt-metalium/experimental/fabric/fabric.hpp
++++ b/tt_metal/api/tt-metalium/experimental/fabric/fabric.hpp
+@@ -26,6 +26,7 @@ struct ProgramDescriptor;
+ namespace tt::tt_metal::distributed {
+ class MeshDevice;
+ class MeshShape;
++class MeshCoordinate;
+ }  // namespace tt::tt_metal::distributed
+ 
+ namespace tt::tt_fabric {
+@@ -36,6 +37,13 @@ size_t get_tt_fabric_channel_buffer_size_bytes();
+ size_t get_tt_fabric_packet_header_size_bytes();
+ size_t get_tt_fabric_max_payload_size_bytes();
+ 
++// Return the fabric node configured as the local static inter-mesh endpoint.
++// The physical endpoint chip remains a topology/configuration concern and
++// should not be duplicated by operations using the static link.
++FabricNodeId get_static_intermesh_endpoint_fabric_node_id();
++uint32_t get_static_intermesh_endpoint_link_count();
++tt::tt_metal::distributed::MeshCoordinate get_fabric_mesh_coordinate(const FabricNodeId& node_id);
++
+ // Used to get the run-time args for establishing connection with the fabric router.
+ // The API appends the connection specific run-time args to the set of existing
+ // run-time args for the worker programs, which allows the workers to conveniently
+@@ -72,6 +80,29 @@ void append_fabric_connection_rt_args(
+     std::vector<uint32_t>& worker_args,
+     CoreType core_type = CoreType::WORKER);
+ 
++// Connect a worker directly to an explicitly instantiated static endpoint EDM.
++void append_static_intermesh_connection_rt_args(
++    chan_id_t fabric_router_channel,
++    tt::tt_metal::Program& worker_program,
++    const tt::tt_metal::CoreCoord& worker_core,
++    std::vector<uint32_t>& worker_args);
++
++// Connect a worker directly to the static endpoint EDM selected by the active
++// FabricRouterConfig. The configured zero-based link index is resolved against
++// the live cross-host Ethernet channels discovered for the endpoint chip.
++void append_static_intermesh_connection_rt_args(
++    tt::tt_metal::Program& worker_program,
++    const tt::tt_metal::CoreCoord& worker_core,
++    std::vector<uint32_t>& worker_args);
++
++// Select one of the configured static endpoint lanes. Lane zero is identical
++// to the legacy overload above.
++void append_static_intermesh_lane_connection_rt_args(
++    uint32_t lane,
++    tt::tt_metal::Program& worker_program,
++    const tt::tt_metal::CoreCoord& worker_core,
++    std::vector<uint32_t>& worker_args);
++
+ enum class FabricApiType : uint8_t {
+     Linear = 0,
+     Mesh = 1,
+diff --git a/tt_metal/api/tt-metalium/experimental/fabric/fabric_types.hpp b/tt_metal/api/tt-metalium/experimental/fabric/fabric_types.hpp
+index 70a877398557871fdb8672a2f34077c7c86d3a40..10be25e08c18464c184c89e1a2b75fb5fea55ae3 100644
+--- a/tt_metal/api/tt-metalium/experimental/fabric/fabric_types.hpp
++++ b/tt_metal/api/tt-metalium/experimental/fabric/fabric_types.hpp
+@@ -55,10 +55,32 @@ bool has_flag(FabricManagerMode flags, FabricManagerMode test_flag);
+ 
+ // Configuration for router-level parameters
+ // Extensible for future router tuning (buffer counts, VC settings, etc.)
++enum class StaticIntermeshEndpointRole : uint8_t { DISABLED = 0, GALAXY_GATEWAY = 1, T3K_ENDPOINT = 2 };
++
+ struct FabricRouterConfig {
+     // Optional override for maximum packet payload size (bytes)
+     // If not set, uses architecture and routing mode defaults
+     std::optional<size_t> max_packet_payload_size_bytes = std::nullopt;
++
++    // Keep directly connected inter-mesh traffic on VC0 and omit VC1 router
++    // channels/code. Intended for acyclic endpoint-to-endpoint topologies.
++    bool intermesh_vc0_only = false;
++
++    // Bring-up mode for a single physical inter-host Ethernet lane. The lane is
++    // instantiated as a local Z router even though it is not part of the mesh
++    // graph discovered on either host.
++    StaticIntermeshEndpointRole static_intermesh_endpoint_role = StaticIntermeshEndpointRole::DISABLED;
++    uint32_t static_intermesh_endpoint_physical_chip = 0;
++    // Zero-based link within the selected inter-host cable. Physical Ethernet
++    // channels are role-specific and are resolved by the fabric host code.
++    uint32_t static_intermesh_endpoint_link_index = 0;
++    // Number of consecutive live cross-host links, starting at
++    // static_intermesh_endpoint_link_index, to instantiate as static Z
++    // endpoints. One preserves the original single-link behaviour.
++    uint32_t static_intermesh_endpoint_link_count = 1;
++    uint32_t static_intermesh_peer_handshake_address = 0;
++    uint32_t static_intermesh_peer_receiver_base_address = 0;
++    uint32_t static_intermesh_peer_receiver_num_slots = 0;
+ };
+ 
+ enum class FabricType {
+diff --git a/tt_metal/fabric/builder/fabric_builder_config.cpp b/tt_metal/fabric/builder/fabric_builder_config.cpp
+index 66347e87c2478f40a615a59ad4ad2d31615d1669..ca3bca48bb19ccd654fcd7b29eea8d90d8394311 100644
+--- a/tt_metal/fabric/builder/fabric_builder_config.cpp
++++ b/tt_metal/fabric/builder/fabric_builder_config.cpp
+@@ -8,9 +8,43 @@
+ #include "tt_metal/fabric/fabric_context.hpp"
+ 
+ #include <cstdint>
++#include <optional>
++#include <utility>
+ 
+ namespace tt::tt_fabric::builder_config {
+ 
++uint32_t static_z_edge_skip_directions_bitmask(uint32_t chip_id, uint32_t fabric_ns, uint32_t fabric_ew) {
++    const uint32_t row = chip_id / fabric_ew;
++    const uint32_t col = chip_id % fabric_ew;
++    // A static Z router replaces one physically absent cardinal source slot.
++    // Select exactly one missing direction even at a corner: this keeps the
++    // Z-router layout identical for edge and corner gateways (worker + three
++    // forwarding sources), while individual mesh routers may still compact
++    // every physically absent source direction.
++    if (col == 0) {
++        return 1u << eth_chan_directions::WEST;
++    }
++    if (col + 1 == fabric_ew) {
++        return 1u << eth_chan_directions::EAST;
++    }
++    if (row == 0) {
++        return 1u << eth_chan_directions::NORTH;
++    }
++    if (row + 1 == fabric_ns) {
++        return 1u << eth_chan_directions::SOUTH;
++    }
++    return 0;
++}
++
++uint32_t static_mesh_edge_skip_directions_bitmask(uint32_t chip_id, uint32_t fabric_ns, uint32_t fabric_ew) {
++    // A mesh router already excludes its own direction from the three cardinal
++    // source positions. Replace exactly one additional physically absent edge
++    // source with the local Z source. This gives worker + two cardinal + Z = 4
++    // channels on both an edge and a corner; removing every corner boundary
++    // would incorrectly collapse the layout to three channels.
++    return static_z_edge_skip_directions_bitmask(chip_id, fabric_ns, fabric_ew);
++}
++
+ uint32_t get_sender_channel_count(const bool is_2D_routing) {
+     return is_2D_routing ? builder_config::num_sender_channels_2d : builder_config::num_sender_channels_1d;
+ }
+diff --git a/tt_metal/fabric/builder/fabric_builder_config.hpp b/tt_metal/fabric/builder/fabric_builder_config.hpp
+index 4b323dc55ab34692dc84f971d274b78579c7e2b1..98a04278f4a4ada38bd2ae878c46c24cd992491e 100644
+--- a/tt_metal/fabric/builder/fabric_builder_config.hpp
++++ b/tt_metal/fabric/builder/fabric_builder_config.hpp
+@@ -114,6 +114,14 @@ uint32_t get_receiver_channel_count(bool is_2D_routing);
+ 
+ uint32_t get_num_used_sender_channel_count(Topology topology);
+ 
++// Pick one physically absent cardinal source on an edge/corner chip.  Static
++// Z endpoints use this to compact one dead mesh->Z sender channel.
++uint32_t static_z_edge_skip_directions_bitmask(uint32_t chip_id, uint32_t fabric_ns, uint32_t fabric_ew);
++
++// Pick the same absent cardinal source for the gateway's mesh routers, which
++// replace that source channel with Z.
++uint32_t static_mesh_edge_skip_directions_bitmask(uint32_t chip_id, uint32_t fabric_ns, uint32_t fabric_ew);
++
+ uint32_t get_num_tensix_sender_channels(Topology topology, tt::tt_fabric::FabricTensixConfig fabric_tensix_config);
+ 
+ uint32_t get_downstream_edm_count(bool is_2D_routing);
+diff --git a/tt_metal/fabric/builder/fabric_remote_channels_allocator.hpp b/tt_metal/fabric/builder/fabric_remote_channels_allocator.hpp
+index 698b339cb0a54e34dacead3d749ffeff880b12aa..67f79cb0e1a5c61a20212b861c55b3773afeabc9 100644
+--- a/tt_metal/fabric/builder/fabric_remote_channels_allocator.hpp
++++ b/tt_metal/fabric/builder/fabric_remote_channels_allocator.hpp
+@@ -74,6 +74,19 @@ public:
+      */
+     size_t get_remote_receiver_channel_num_buffers(size_t vc_id, size_t channel_id) const;
+ 
++    void set_remote_receiver_channel_base_address(size_t vc_id, size_t channel_id, size_t base_address) {
++        TT_FATAL(vc_id < builder_config::MAX_NUM_VCS, "VC ID out of bounds");
++        TT_FATAL(channel_id < num_used_receiver_channels_per_vc_[vc_id], "Receiver channel ID out of bounds");
++        remote_receiver_channels_base_address_[vc_id][channel_id] = base_address;
++    }
++
++    void set_remote_receiver_channel_num_buffers(size_t vc_id, size_t channel_id, size_t num_buffers) {
++        TT_FATAL(vc_id < builder_config::MAX_NUM_VCS, "VC ID out of bounds");
++        TT_FATAL(channel_id < num_used_receiver_channels_per_vc_[vc_id], "Receiver channel ID out of bounds");
++        TT_FATAL(num_buffers > 0, "Remote receiver channel must have at least one buffer");
++        remote_receiver_channels_num_buffers_[vc_id][channel_id] = num_buffers;
++    }
++
+     /**
+      * Legacy getter for VC0 only (for backward compatibility).
+      * @param channel_id Channel ID
+diff --git a/tt_metal/fabric/builder/fabric_static_sized_channels_allocator.cpp b/tt_metal/fabric/builder/fabric_static_sized_channels_allocator.cpp
+index 79c3b6fb0f85c757f536c213ed048aaa42e30383..a842bf8d59093c26d38bee095cbfd37b3d9c2f37 100644
+--- a/tt_metal/fabric/builder/fabric_static_sized_channels_allocator.cpp
++++ b/tt_metal/fabric/builder/fabric_static_sized_channels_allocator.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "tt_metal/fabric/builder/fabric_static_sized_channels_allocator.hpp"
++#include "tt_metal/fabric/builder/fabric_builder_config.hpp"
+ #include "tt_metal/fabric/builder/fabric_builder_helpers.hpp"
+ #include "tt_metal/fabric/fabric_context.hpp"
+ #include "impl/context/metal_context.hpp"
+@@ -224,7 +225,6 @@ FabricStaticSizedChannelsAllocator::FabricStaticSizedChannelsAllocator(
+         uint32_t target_channel = get_worker_connected_sender_channel();
+         return !((vc_id == 0 && idx == target_channel) || !has_tensix_extension);
+     };
+-
+     // Validate sender channels per VC
+     for (size_t vc = 0; vc < builder_config::MAX_NUM_VCS; ++vc) {
+         for (uint32_t i = 0; i < num_used_sender_channels_per_vc[vc]; i++) {
+@@ -340,7 +340,8 @@ void FabricStaticSizedChannelsAllocator::configure_buffer_slots_helper(
+     auto get_num_buffer_slots = [](Topology topology,
+                                    size_t arch_index,
+                                    bool vc1_present,
+-                                   bool vc2_present) -> const std::vector<PerVcBufferSlots>& {
++                                   bool vc2_present,
++                                   bool terminal_worker_only) -> const std::vector<PerVcBufferSlots>& {
+         // Architecture-specific buffer slot configurations per VC, split by active VC count
+         // Format: {vc0_sender, vc0_receiver, vc1_sender, vc1_receiver, vc2_sender, vc2_receiver}
+ 
+@@ -468,9 +469,13 @@ void FabricStaticSizedChannelsAllocator::configure_buffer_slots_helper(
+             vc0_vc2_mesh_buffer_slot_options);
+         static ttsl::Indestructible<std::vector<std::vector<PerVcBufferSlots>>> vc0_vc1_vc2_mesh_slots(
+             vc0_vc1_vc2_mesh_buffer_slot_options);
+-        static ttsl::Indestructible<std::vector<std::vector<PerVcBufferSlots>>> other_slots(
+-            other_buffer_slot_options);
++        static ttsl::Indestructible<std::vector<std::vector<PerVcBufferSlots>>> other_slots(other_buffer_slot_options);
+ 
++        if (terminal_worker_only) {
++            // Static T3K endpoint: one worker sender + one link receiver, with no
++            // mesh/Z forwarding channels. Reuse the established 1D VC0 budget.
++            return other_slots.get()[arch_index];
++        }
+         if (topology == Topology::Mesh || topology == Topology::Torus) {
+             // Select table based on which VCs are actually active
+             if (vc1_present && vc2_present) {
+@@ -632,6 +637,14 @@ void FabricStaticSizedChannelsAllocator::configure_buffer_slots_helper(
+                 vc2_sender_buffer_slots,
+                 vc2_receiver_buffer_slots);
+ 
++            const auto& router_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++            if (router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY) {
++                // This allocator services only the Tensix-connected injection sender plus the link receiver;
++                // cardinal forwarding senders live in the non-MUX router allocations.  Match the T3K peer's
++                // 16-slot receiver window so the worker can keep a full batch in flight.
++                vc0_sender_buffer_slots = 16;
++            }
++
+             // set buffer slots for VC0 worker channel only
+             num_sender_buffer_slots_per_vc[0][target_channel] = vc0_sender_buffer_slots;
+             num_remote_sender_buffer_slots_per_vc[0][target_channel] = vc0_sender_buffer_slots;
+@@ -658,8 +671,13 @@ void FabricStaticSizedChannelsAllocator::configure_buffer_slots_helper(
+     bool vc2_present = (num_used_sender_channels_per_vc[2] > 0 || num_used_receiver_channels_per_vc[2] > 0);
+ 
+     // Get optimal buffer slots considering active VCs
++    const auto& router_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    const bool terminal_worker_only =
++        router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::T3K_ENDPOINT &&
++        num_used_sender_channels_per_vc[0] == 1 && num_used_receiver_channels_per_vc[0] == 1 && !vc1_present &&
++        !vc2_present;
+     get_optimal_num_slots_per_vc(
+-        get_num_buffer_slots(topology, arch_index, vc1_present, vc2_present),
++        get_num_buffer_slots(topology, arch_index, vc1_present, vc2_present, terminal_worker_only),
+         num_used_sender_channels_per_vc[0],
+         num_used_receiver_channels_per_vc[0],
+         num_used_sender_channels_per_vc[1],
+@@ -717,7 +735,8 @@ void FabricStaticSizedChannelsAllocator::emit_channel_allocations_ct_args(
+     size_t num_used_vc0_sender_channels,
+     size_t num_used_vc1_sender_channels,
+     size_t num_used_vc2_sender_channels,
+-    size_t num_used_receiver_channels) const {
++    size_t num_used_receiver_channels,
++    std::optional<size_t> vc0_sender_hole) const {
+     // Tag
+     ct_args.push_back(0xabcd1234);
+ 
+@@ -730,6 +749,24 @@ void FabricStaticSizedChannelsAllocator::emit_channel_allocations_ct_args(
+     // Per-entry data (reuse existing emit_ct_args which emits per-channel data)
+     emit_ct_args(ct_args);
+ 
++    if (vc0_sender_hole.has_value()) {
++        TT_FATAL(
++            get_num_sender_channels(0) + 1 == num_used_vc0_sender_channels && num_used_vc1_sender_channels == 0 &&
++                num_used_vc2_sender_channels == 0,
++            "Sparse VC0 mapping requires exactly one sender hole and no higher VCs");
++        const size_t hole = *vc0_sender_hole;
++        TT_FATAL(hole < num_used_vc0_sender_channels, "VC0 sender hole {} is out of range", hole);
++        for (size_t physical_ch = 0; physical_ch < num_used_vc0_sender_channels; ++physical_ch) {
++            ct_args.push_back(
++                static_cast<uint32_t>(physical_ch == hole ? 0 : (physical_ch < hole ? physical_ch : physical_ch - 1)));
++        }
++        const size_t receiver_entry_base = total_sender_channels;
++        for (size_t i = 0; i < num_used_receiver_channels; ++i) {
++            ct_args.push_back(static_cast<uint32_t>(receiver_entry_base + i));
++        }
++        return;
++    }
++
+     // Channel-to-entry index mappings
+     //
+     // The allocator emits entries in order: VC0 senders [0 .. total_vc0), VC1 senders
+diff --git a/tt_metal/fabric/builder/fabric_static_sized_channels_allocator.hpp b/tt_metal/fabric/builder/fabric_static_sized_channels_allocator.hpp
+index ed0bebed07a4109aec026ace5b537afb6288e7eb..9c7a2ef285f59e43b64e8d9bab7704c9ab828471 100644
+--- a/tt_metal/fabric/builder/fabric_static_sized_channels_allocator.hpp
++++ b/tt_metal/fabric/builder/fabric_static_sized_channels_allocator.hpp
+@@ -48,7 +48,8 @@ public:
+         size_t num_used_vc0_sender_channels,
+         size_t num_used_vc1_sender_channels,
+         size_t num_used_vc2_sender_channels,
+-        size_t num_used_receiver_channels) const;
++        size_t num_used_receiver_channels,
++        std::optional<size_t> vc0_sender_hole = std::nullopt) const;
+ 
+     /**
+      * Get the number of slots for a specific sender channel in a VC.
+diff --git a/tt_metal/fabric/builder/router_connection_mapping.cpp b/tt_metal/fabric/builder/router_connection_mapping.cpp
+index 2fb4041d29d8f4da1c18d5668bfb8ec7ae8bcf75..e07b4e8c5d3d7f0699349cf9dcc18e198e5e7672 100644
+--- a/tt_metal/fabric/builder/router_connection_mapping.cpp
++++ b/tt_metal/fabric/builder/router_connection_mapping.cpp
+@@ -196,9 +196,19 @@ RouterConnectionMapping RouterConnectionMapping::for_mesh_router(
+     return mapping;
+ }
+ 
+-RouterConnectionMapping RouterConnectionMapping::for_z_router() {
++RouterConnectionMapping RouterConnectionMapping::for_z_router(bool enable_vc1) {
+     RouterConnectionMapping mapping;
+ 
++    std::vector<RoutingDirection> vc0_outbound_directions = {
++        RoutingDirection::E, RoutingDirection::W, RoutingDirection::N, RoutingDirection::S};
++    for (size_t i = 0; i < vc0_outbound_directions.size(); ++i) {
++        mapping.add_target(0, 0, ConnectionTarget(ConnectionType::Z_TO_MESH, 0, i + 1, vc0_outbound_directions[i]));
++    }
++
++    if (!enable_vc1) {
++        return mapping;
++    }
++
+     std::vector<RoutingDirection> vc1_outbound_directions = {
+         RoutingDirection::E,  // Forward to EAST mesh router
+         RoutingDirection::W,  // Forward to WEST mesh router
+diff --git a/tt_metal/fabric/builder/router_connection_mapping.hpp b/tt_metal/fabric/builder/router_connection_mapping.hpp
+index f000b453518b7639bd1c46800d349890d10fd1c6..436a596299b12ae81702bfc8e9249046c9932d15 100644
+--- a/tt_metal/fabric/builder/router_connection_mapping.hpp
++++ b/tt_metal/fabric/builder/router_connection_mapping.hpp
+@@ -115,7 +115,7 @@ public:
+      *
+      * @return Configured RouterConnectionMapping for Z router
+      */
+-    static RouterConnectionMapping for_z_router();
++    static RouterConnectionMapping for_z_router(bool enable_vc1 = true);
+ 
+     /**
+      * @brief Check if a receiver channel has any downstream targets
+diff --git a/tt_metal/fabric/compute_mesh_router_builder.cpp b/tt_metal/fabric/compute_mesh_router_builder.cpp
+index 3d19e0202b2c25b5945719daf79fdc1f9775a4fd..ccd14235d87b5f9beedcc9d98072d35cc145df55 100644
+--- a/tt_metal/fabric/compute_mesh_router_builder.cpp
++++ b/tt_metal/fabric/compute_mesh_router_builder.cpp
+@@ -10,10 +10,12 @@
+ #include "tt_metal/fabric/fabric_builder_context.hpp"
+ #include "tt_metal/fabric/channel_trimming_import.hpp"
+ #include "tt_metal/fabric/builder/fabric_builder_helpers.hpp"
++#include "tt_metal/fabric/builder/fabric_builder_config.hpp"
+ #include "tt_metal/fabric/builder/fabric_core_placement.hpp"
+ #include "impl/context/metal_context.hpp"
+ #include "impl/kernels/kernel.hpp"
+ #include <tt-metalium/experimental/fabric/control_plane.hpp>
++#include <tt-metalium/experimental/fabric/fabric.hpp>
+ #include "tt_metal/third_party/umd/device/api/umd/device/types/core_coordinates.hpp"
+ #include "llrt/metal_soc_descriptor.hpp"
+ #include "tt_metal.hpp"
+@@ -170,11 +172,48 @@ RouterChannelCounts compute_router_channel_counts(
+     const auto topology = fabric_context.get_fabric_topology();
+     const auto fabric_tensix_config = tt::tt_metal::MetalContext::instance().get_fabric_tensix_config();
+     const bool downstream_is_tensix_builder = !is_dispatch_link && fabric_tensix_config == FabricTensixConfig::MUX;
+-    const bool has_z_router = fabric_context.has_z_router_on_device(control_plane, fabric_node_id);
++    const auto& router_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    const auto physical_chip = control_plane.get_physical_chip_id_from_fabric_node_id(fabric_node_id);
++    const bool has_static_z =
++        router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY &&
++        physical_chip == router_config.static_intermesh_endpoint_physical_chip;
++    const bool has_z_router = fabric_context.has_z_router_on_device(control_plane, fabric_node_id) || has_static_z;
+     const auto variant = (direction == RoutingDirection::Z) ? RouterVariant::Z_ROUTER : RouterVariant::MESH;
+     const auto& intermesh_config = fabric_context.get_builder_context().get_intermesh_vc_config();
+-    auto channel_mapping =
+-        FabricRouterChannelMapping(topology, downstream_is_tensix_builder, variant, &intermesh_config, has_z_router);
++    const bool terminal_static_t3k =
++        router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::T3K_ENDPOINT &&
++        physical_chip == router_config.static_intermesh_endpoint_physical_chip && direction == RoutingDirection::Z;
++    uint32_t static_z_skip_mask = 0;
++    uint32_t static_mesh_skip_mask = 0;
++    if (has_static_z && variant == RouterVariant::Z_ROUTER) {
++        const auto& mesh_graph = control_plane.get_mesh_graph();
++        const auto mesh_shape = mesh_graph.get_mesh_shape(fabric_node_id.mesh_id);
++        const auto mesh_coord = mesh_graph.chip_to_coordinate(fabric_node_id.mesh_id, fabric_node_id.chip_id);
++        const uint32_t row_major_chip = static_cast<uint32_t>(mesh_coord[0]) * static_cast<uint32_t>(mesh_shape[1]) +
++                                        static_cast<uint32_t>(mesh_coord[1]);
++        static_z_skip_mask = builder_config::static_z_edge_skip_directions_bitmask(
++            row_major_chip, static_cast<uint32_t>(mesh_shape[0]), static_cast<uint32_t>(mesh_shape[1]));
++        TT_FATAL(static_z_skip_mask != 0, "Static Galaxy Z endpoint must be on a mesh edge");
++    }
++    if (has_static_z) {
++        const auto& mesh_graph = control_plane.get_mesh_graph();
++        const auto mesh_shape = mesh_graph.get_mesh_shape(fabric_node_id.mesh_id);
++        const auto mesh_coord = mesh_graph.chip_to_coordinate(fabric_node_id.mesh_id, fabric_node_id.chip_id);
++        const uint32_t row_major_chip = static_cast<uint32_t>(mesh_coord[0]) * static_cast<uint32_t>(mesh_shape[1]) +
++                                        static_cast<uint32_t>(mesh_coord[1]);
++        static_mesh_skip_mask = builder_config::static_mesh_edge_skip_directions_bitmask(
++            row_major_chip, static_cast<uint32_t>(mesh_shape[0]), static_cast<uint32_t>(mesh_shape[1]));
++    }
++    auto channel_mapping = FabricRouterChannelMapping(
++        topology,
++        downstream_is_tensix_builder,
++        variant,
++        &intermesh_config,
++        has_z_router,
++        terminal_static_t3k,
++        static_z_skip_mask,
++        static_mesh_skip_mask,
++        static_cast<eth_chan_directions>(direction));
+ 
+     RouterChannelCounts counts;
+     const uint32_t num_vcs = channel_mapping.get_num_virtual_channels();
+@@ -264,18 +303,56 @@ std::unique_ptr<ComputeMeshRouterBuilder> ComputeMeshRouterBuilder::build(
+     const auto& edm_config = builder_context.get_fabric_router_config(tensix_config_for_lookup, eth_direction);
+ 
+     // Determine the router variant
+-    bool has_z_router = fabric_context.has_z_router_on_device(control_plane, local_node);
++    const auto& router_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    const bool has_static_z =
++        router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY &&
++        device->id() == router_config.static_intermesh_endpoint_physical_chip;
++    bool has_z_router = fabric_context.has_z_router_on_device(control_plane, local_node) || has_static_z;
+     RouterVariant variant = (location.direction == RoutingDirection::Z) ? RouterVariant::Z_ROUTER : RouterVariant::MESH;
+ 
+     // Create channel mapping EARLY (needed for computing injection flags)
+     const auto& intermesh_config = fabric_context.get_builder_context().get_intermesh_vc_config();
+-    auto channel_mapping =
+-        FabricRouterChannelMapping(topology, downstream_is_tensix_builder, variant, &intermesh_config, has_z_router);
++    const bool terminal_static_t3k =
++        router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::T3K_ENDPOINT &&
++        device->id() == router_config.static_intermesh_endpoint_physical_chip && variant == RouterVariant::Z_ROUTER;
++    uint32_t static_z_skip_mask = 0;
++    uint32_t static_mesh_skip_mask = 0;
++    if (has_static_z && variant == RouterVariant::Z_ROUTER) {
++        const auto& mesh_graph = control_plane.get_mesh_graph();
++        const auto mesh_shape = mesh_graph.get_mesh_shape(local_node.mesh_id);
++        const auto mesh_coord = mesh_graph.chip_to_coordinate(local_node.mesh_id, local_node.chip_id);
++        const uint32_t row_major_chip = static_cast<uint32_t>(mesh_coord[0]) * static_cast<uint32_t>(mesh_shape[1]) +
++                                        static_cast<uint32_t>(mesh_coord[1]);
++        static_z_skip_mask = builder_config::static_z_edge_skip_directions_bitmask(
++            row_major_chip, static_cast<uint32_t>(mesh_shape[0]), static_cast<uint32_t>(mesh_shape[1]));
++        TT_FATAL(static_z_skip_mask != 0, "Static Galaxy Z endpoint must be on a mesh edge");
++    }
++    if (has_static_z) {
++        const auto& mesh_graph = control_plane.get_mesh_graph();
++        const auto mesh_shape = mesh_graph.get_mesh_shape(local_node.mesh_id);
++        const auto mesh_coord = mesh_graph.chip_to_coordinate(local_node.mesh_id, local_node.chip_id);
++        const uint32_t row_major_chip = static_cast<uint32_t>(mesh_coord[0]) * static_cast<uint32_t>(mesh_shape[1]) +
++                                        static_cast<uint32_t>(mesh_coord[1]);
++        static_mesh_skip_mask = builder_config::static_mesh_edge_skip_directions_bitmask(
++            row_major_chip, static_cast<uint32_t>(mesh_shape[0]), static_cast<uint32_t>(mesh_shape[1]));
++    }
++    auto channel_mapping = FabricRouterChannelMapping(
++        topology,
++        downstream_is_tensix_builder,
++        variant,
++        &intermesh_config,
++        has_z_router,
++        terminal_static_t3k,
++        static_z_skip_mask,
++        static_mesh_skip_mask,
++        eth_direction);
+ 
+     // Create connection mapping (Phase 3)
+     RouterConnectionMapping connection_mapping;
+-    if (variant == RouterVariant::Z_ROUTER) {
+-        connection_mapping = RouterConnectionMapping::for_z_router();
++    if (terminal_static_t3k) {
++        connection_mapping = RouterConnectionMapping{};
++    } else if (variant == RouterVariant::Z_ROUTER) {
++        connection_mapping = RouterConnectionMapping::for_z_router(intermesh_config.requires_vc1);
+     } else {
+         // Enable VC1 for all routers when intermesh VC is configured
+         bool enable_vc1 = intermesh_config.requires_vc1;
+@@ -444,11 +521,49 @@ std::unique_ptr<ComputeMeshRouterBuilder> ComputeMeshRouterBuilder::build(
+ }
+ 
+ uint32_t ComputeMeshRouterBuilder::get_downstream_sender_channel(
+-    const bool is_2D_routing, const eth_chan_directions downstream_direction, uint32_t vc) const {
++    const bool is_2D_routing,
++    const eth_chan_directions downstream_direction,
++    uint32_t vc,
++    std::optional<uint32_t> downstream_skip_directions_bitmask) const {
+     if (!is_2D_routing) {
+         return 1;  // 1D: sender channel 1 for forwarding
+     }
+ 
++    // static edge compaction path: downstream router's source map excludes self direction AND every direction
++    // marked in the skip bitmask (fabric mesh boundary + submesh boundary). compact_index for
++    // our (upstream) direction = its position when iterating cardinal directions skipping all
++    // of those.
++    if (downstream_skip_directions_bitmask.has_value()) {
++        const auto upstream_dir = static_cast<uint32_t>(this->get_eth_direction());
++        const auto ds_dir = static_cast<uint32_t>(downstream_direction);
++        const uint32_t skip_mask = *downstream_skip_directions_bitmask;
++        uint32_t compact = 0;
++        if (upstream_dir == eth_chan_directions::Z) {
++            for (uint32_t d = 0; d < eth_chan_directions::COUNT - 1; d++) {
++                if (d != ds_dir && !(skip_mask & (1u << d))) {
++                    compact++;
++                }
++            }
++            return (vc == 0) ? (1 + compact) : compact;
++        }
++        for (uint32_t d = 0; d < eth_chan_directions::COUNT - 1; d++) {  // cardinals only
++            if (d == ds_dir) {
++                continue;  // self
++            }
++            if (skip_mask & (1u << d)) {
++                continue;  // fabric or submesh boundary
++            }
++            if (d == upstream_dir) {
++                return (vc == 0) ? (1 + compact) : compact;
++            }
++            compact++;
++        }
++        // Upstream direction itself is in the skip mask (e.g., upstream is across a submesh
++        // boundary). Downstream router does not allocate a source channel for it — return a
++        // sentinel that fail-fasts upstream connection setup.
++        return std::numeric_limits<uint32_t>::max();
++    }
++
+     // Sender channel 0 is always reserved for the local worker (VC0 only).
+     //
+     // VC0: Sender channels 1–4 correspond to the four upstream neighbors (E/W/N/S/Z)
+@@ -681,18 +796,70 @@ void ComputeMeshRouterBuilder::establish_connections_to_router(
+                 continue;
+             }
+ 
+-            // Compute sender channel on downstream router based on directions and VC
+-            uint32_t downstream_sender_channel =
+-                get_downstream_sender_channel(is_2D_routing, downstream_router.get_eth_direction(), vc);
+-
+-            // Validate the channel index using downstream router's channel mapping
++            // Compute sender channel on downstream router based on directions and VC.
++            // In static edge compaction mode, the downstream router's source channel mapping skips multiple
++            // directions: fabric-mesh boundary AND submesh boundary. Derive the bitmask from
++            // the downstream chip's position in the fabric mesh.
++            std::optional<uint32_t> downstream_skip_mask;
++            if (is_2D_routing && downstream_router.channel_mapping_.is_z_router() &&
++                downstream_router.channel_mapping_.get_z_vc0_skip_directions_bitmask() != 0 && vc == 0) {
++                downstream_skip_mask = downstream_router.channel_mapping_.get_z_vc0_skip_directions_bitmask();
++            } else if (
++                is_2D_routing && downstream_router.channel_mapping_.is_mesh_router() &&
++                downstream_router.channel_mapping_.get_mesh_vc0_skip_directions_bitmask() != 0 && vc == 0) {
++                downstream_skip_mask = downstream_router.channel_mapping_.get_mesh_vc0_skip_directions_bitmask();
++            }
++            uint32_t downstream_sender_channel = get_downstream_sender_channel(
++                is_2D_routing, downstream_router.get_eth_direction(), vc, downstream_skip_mask);
++
++            // Validate the channel index using downstream router's channel mapping.
++            // static edge compaction-with-submesh: out-of-range here means the upstream direction is in the ds
++            // chip's skip set (boundary, including self). That cardinal connection has no real
++            // mapping target but fabric init still needs the slot populated so router state
++            // stays consistent (sync-handshake completes). Dummy-map onto the LAST valid source
++            // channel (num_channels - 1), NOT ch 0. ch 0 is the worker channel and carries
++            // real chip-local worker traffic — colliding inter-chip dummy connections there
++            // corrupts the worker connection state and hangs. Source channels carry no traffic
++            // under the static edge compaction MeshSocket workload assumption, so the dummy collision there is
++            // harmless.
+             uint32_t num_sender_channels_for_vc = downstream_router.channel_mapping_.get_num_sender_channels_for_vc(vc);
+-            TT_FATAL(
+-                downstream_sender_channel < num_sender_channels_for_vc,
+-                "Computed downstream sender channel {} exceeds available channels ({}) for VC{} on downstream router",
+-                downstream_sender_channel,
+-                num_sender_channels_for_vc,
+-                vc);
++            if (downstream_sender_channel >= num_sender_channels_for_vc) {
++                // static edge compaction: this upstream direction is in the downstream router's skip mask, so the
++                // downstream router has no sender channel slot allocated for traffic from this
++                // direction. The previous behavior was to dummy-map this connection onto
++                // (num_sender_channels_for_vc - 1) so the kernel-side init handshake would still
++                // "see" a producer for that slot; but the dummy-mapped slot is the SAME slot used
++                // by the real producer in that compact position (e.g. on a Galaxy 4x2 submesh
++                // boundary chip with mask=E, the dummy E->S connection lands on slot 2 which is
++                // also the real N->S slot). The dummy setup overwrites the real producer's
++                // cached_producer_noc_addr on the downstream sender channel state, so at runtime
++                // credit returns are routed to the dummy upstream and the real upstream stalls.
++                //
++                // Skip the setup entirely. The downstream router's slot still has a producer from
++                // its real-direction connection (set up by a different iteration of this loop), so
++                // init handshake completes for that slot. The masked direction has no slot, so its
++                // producer-side runtime arg simply has no downstream interface populated — which is
++                // correct under the static edge compaction workload contract (no traffic flows from a masked
++                // direction).
++                TT_FATAL(
++                    downstream_router.channel_mapping_.get_z_vc0_skip_directions_bitmask() != 0 ||
++                        downstream_router.channel_mapping_.get_mesh_vc0_skip_directions_bitmask() != 0,
++                    "Computed downstream sender channel {} exceeds available channels ({}) for VC{} on downstream "
++                    "router (static edge compaction mode not enabled, this is unexpected)",
++                    downstream_sender_channel,
++                    num_sender_channels_for_vc,
++                    vc);
++                log_debug(
++                    tt::LogFabric,
++                    "static edge compaction: skip VC{} connection from router(my_dir={}, chip={}) to "
++                    "ds(my_dir={}, chip={}) — ds skip-mask excludes upstream direction.",
++                    vc,
++                    static_cast<int>(this->get_eth_direction()),
++                    local_node_.chip_id,
++                    static_cast<int>(downstream_router.get_eth_direction()),
++                    downstream_router.local_node_.chip_id);
++                continue;
++            }
+ 
+             // Get downstream builder and mapping
+             auto* downstream_builder = downstream_router.get_builder_for_vc_channel(vc, downstream_sender_channel);
+@@ -790,6 +957,16 @@ void ComputeMeshRouterBuilder::configure_connection(
+ 
+ void ComputeMeshRouterBuilder::configure_local_connections(
+     const std::map<RoutingDirection, FabricRouterBuilder*>& local_routers) {
++    const auto& router_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
++    const auto physical_chip = control_plane.get_physical_chip_id_from_fabric_node_id(local_node_);
++    if (router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::T3K_ENDPOINT &&
++        physical_chip == router_config.static_intermesh_endpoint_physical_chip) {
++        // The terminal T3K Z router is worker-injection/local-write only.  It is
++        // intentionally not part of the chip's cardinal mesh forwarding graph.
++        return;
++    }
++
+     // Establish local connections (MESH_TO_Z or Z_TO_MESH) to routers on same device
+     // We need to look up target routers by direction from the map
+     auto local_connection_filter = [](ConnectionType type) {
+@@ -852,6 +1029,25 @@ void ComputeMeshRouterBuilder::compile_ancillary_kernels(tt::tt_metal::Program&
+ void ComputeMeshRouterBuilder::create_kernel(tt::tt_metal::Program& program, const KernelCreationContext& ctx) {
+     // Build defines
+     std::map<std::string, std::string> defines = {};
++    const auto& static_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    const auto static_physical_chip =
++        tt::tt_metal::MetalContext::instance().get_control_plane().get_physical_chip_id_from_fabric_node_id(
++            local_node_);
++    const bool is_static_endpoint_chip =
++        static_config.static_intermesh_endpoint_role != StaticIntermeshEndpointRole::DISABLED &&
++        static_physical_chip == static_config.static_intermesh_endpoint_physical_chip;
++    if (is_static_endpoint_chip && location_.direction == RoutingDirection::Z) {
++        defines["STATIC_INTERMESH_LINK_ENDPOINT"] = "";
++        if (static_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY) {
++            defines["STATIC_INTERMESH_GALAXY_LINK"] = "";
++        } else {
++            defines["STATIC_INTERMESH_T3K_LINK"] = "";
++        }
++    } else if (
++        is_static_endpoint_chip &&
++        static_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY) {
++        defines["STATIC_INTERMESH_GALAXY_GATEWAY"] = "";
++    }
+     if (ctx.is_2D_routing) {
+         defines["FABRIC_2D"] = "";
+ 
+@@ -889,6 +1085,11 @@ void ComputeMeshRouterBuilder::create_kernel(tt::tt_metal::Program& program, con
+         if (vc0_crossover_to_vc1) {
+             defines["FABRIC_2D_VC0_CROSSOVER_TO_VC1"] = "";
+         }
++
++        defines["STATIC_Z_VC0_SKIP_DIRECTIONS_BITMASK"] =
++            std::to_string(channel_mapping_.get_z_vc0_skip_directions_bitmask());
++        defines["STATIC_MESH_VC0_SKIP_DIRECTIONS_BITMASK"] =
++            std::to_string(channel_mapping_.get_mesh_vc0_skip_directions_bitmask());
+     }
+ 
+     // Get SOC descriptor for eth core lookup
+@@ -916,6 +1117,28 @@ void ComputeMeshRouterBuilder::create_kernel(tt::tt_metal::Program& program, con
+         named_ct_args["NUM_LOCAL_EDMS"] = ctx.num_local_fabric_routers;
+         named_ct_args["EDM_CHANNELS_MASK"] = ctx.router_channels_mask;
+ 
++        if (defines.contains("STATIC_INTERMESH_LINK_ENDPOINT") && risc_id == 0) {
++            TT_FATAL(
++                static_config.static_intermesh_peer_handshake_address != 0,
++                "Static inter-mesh endpoint requires a peer handshake address");
++            named_ct_args["REMOTE_HANDSHAKE_ADDR"] = static_config.static_intermesh_peer_handshake_address;
++            log_info(
++                tt::LogFabric,
++                "Static inter-mesh endpoint: physical_chip={} eth_chan={} role={} handshake_sender={} "
++                "handshake_addr=0x{:08x} remote_handshake_addr=0x{:08x} sender_txq={} receiver_txq={} "
++                "master_chan={} local_router_count={}",
++                device_id,
++                eth_chan,
++                defines.contains("STATIC_INTERMESH_GALAXY_LINK") ? "GALAXY_LINK" : "T3K_LINK",
++                named_ct_args.at("IS_HANDSHAKE_SENDER"),
++                named_ct_args.at("HANDSHAKE_ADDR"),
++                named_ct_args.at("REMOTE_HANDSHAKE_ADDR"),
++                named_ct_args.at("SENDER_TXQ_ID"),
++                named_ct_args.at("RECEIVER_TXQ_ID"),
++                ctx.master_router_chan,
++                ctx.num_local_fabric_routers);
++        }
++
+         // Determine processor
+         auto proc = static_cast<tt::tt_metal::DataMovementProcessor>(risc_id);
+         if (tt::tt_metal::MetalContext::instance().get_cluster().arch() == tt::ARCH::BLACKHOLE &&
+diff --git a/tt_metal/fabric/compute_mesh_router_builder.hpp b/tt_metal/fabric/compute_mesh_router_builder.hpp
+index 86918e73b391799e2b0460b61e23be0b172b54b7..a9d0164073dc82773a07808abd97e262ddfad03d 100644
+--- a/tt_metal/fabric/compute_mesh_router_builder.hpp
++++ b/tt_metal/fabric/compute_mesh_router_builder.hpp
+@@ -77,7 +77,10 @@ public:
+     SenderWorkerAdapterSpec build_connection_to_fabric_channel(uint32_t vc, uint32_t sender_channel_idx);
+ 
+     uint32_t get_downstream_sender_channel(
+-        bool is_2D_routing, eth_chan_directions downstream_direction, uint32_t vc) const;
++        bool is_2D_routing,
++        eth_chan_directions downstream_direction,
++        uint32_t vc,
++        std::optional<uint32_t> downstream_skip_directions_bitmask = std::nullopt) const;
+ 
+     eth_chan_directions get_eth_direction() const;
+     size_t get_noc_x() const;
+diff --git a/tt_metal/fabric/control_plane.cpp b/tt_metal/fabric/control_plane.cpp
+index 7627eb62e7968bb0e27a040aebb4e82f6fa1c8e7..ea8c41bb00f6166bcf22b6788c047a1546eaf33d 100644
+--- a/tt_metal/fabric/control_plane.cpp
++++ b/tt_metal/fabric/control_plane.cpp
+@@ -429,8 +429,8 @@ void ControlPlane::init_control_plane(
+     this->mesh_graph_ = std::make_unique<MeshGraph>(cluster.get_cluster_type(), mesh_graph_desc_file, fabric_config);
+ 
+     auto& driver_ref = const_cast<tt::umd::Cluster&>(*driver);
+-    auto psd =
+-        tt::tt_metal::run_physical_system_discovery(*driver_ref.get_cluster_description(), distributed_context, rtoptions.get_target_device());
++    auto psd = tt::tt_metal::run_physical_system_discovery(
++        *driver_ref.get_cluster_description(), distributed_context, rtoptions.get_target_device());
+     this->physical_system_descriptor_ = std::make_unique<tt::tt_metal::PhysicalSystemDescriptor>(std::move(psd));
+     this->local_mesh_binding_ = this->initialize_local_mesh_binding();
+ 
+@@ -543,8 +543,8 @@ void ControlPlane::init_control_plane_auto_discovery() {
+ 
+     // Initialize physical system descriptor
+     auto& driver_ref = const_cast<tt::umd::Cluster&>(*driver);
+-    auto psd =
+-        tt::tt_metal::run_physical_system_discovery(*driver_ref.get_cluster_description(), distributed_context, rtoptions.get_target_device());
++    auto psd = tt::tt_metal::run_physical_system_discovery(
++        *driver_ref.get_cluster_description(), distributed_context, rtoptions.get_target_device());
+     this->physical_system_descriptor_ = std::make_unique<tt::tt_metal::PhysicalSystemDescriptor>(std::move(psd));
+ 
+     // Generate Mesh graph based on physical system descriptor
+@@ -1380,6 +1380,20 @@ std::set<std::pair<chan_id_t, eth_chan_directions>> ControlPlane::get_active_fab
+             active_fabric_eth_channels.insert({eth_chan, this->routing_direction_to_eth_direction(direction)});
+         }
+     }
++
++    // A static cross-host endpoint is intentionally absent from the logical mesh graph, but it is still a fabric
++    // router launched on the configured endpoint chip. Include it in the active-router view used by firmware setup,
++    // status synchronization, and teardown so those paths agree with FabricBuilder's router quorum.
++    const auto& router_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    if (router_config.static_intermesh_endpoint_role != StaticIntermeshEndpointRole::DISABLED &&
++        this->logical_mesh_chip_id_to_physical_chip_id_mapping_.at(fabric_node_id) ==
++            router_config.static_intermesh_endpoint_physical_chip) {
++        for (uint32_t lane = 0; lane < router_config.static_intermesh_endpoint_link_count; ++lane) {
++            active_fabric_eth_channels.insert(
++                {this->get_static_intermesh_endpoint_eth_channel(lane), eth_chan_directions::Z});
++        }
++    }
++
+     return active_fabric_eth_channels;
+ }
+ 
+@@ -1940,7 +1954,8 @@ void ControlPlane::write_fabric_connections_to_tensix_cores(MeshId mesh_id, Chip
+                 dispatcher_connection_info,
+                 tensix_connection_info,
+                 physical_chip_id,
+-                eth_channel_id);
++                eth_channel_id,
++                router_direction);
+ 
+             // Mark this connection as valid for fabric communication
+             fabric_worker_connections.valid_connections_mask |= (1u << eth_channel_id);
+@@ -1950,6 +1965,57 @@ void ControlPlane::write_fabric_connections_to_tensix_cores(MeshId mesh_id, Chip
+         }
+     }
+ 
++    // The static cross-host endpoint is intentionally absent from the logical mesh graph, so the loop above cannot
++    // discover it. It is nevertheless a real fabric router and workers inject into its VC0 sender channel through the
++    // normal Tensix connection table. Populate that otherwise-zero entry explicitly.
++    const auto& router_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    if (router_config.static_intermesh_endpoint_role != StaticIntermeshEndpointRole::DISABLED &&
++        physical_chip_id == router_config.static_intermesh_endpoint_physical_chip) {
++        for (uint32_t lane = 0; lane < router_config.static_intermesh_endpoint_link_count; ++lane) {
++            const auto eth_channel_id = this->get_static_intermesh_endpoint_eth_channel(lane);
++            const uint32_t connection_bit = 1u << eth_channel_id;
++            TT_FATAL(
++                (fabric_tensix_connections.valid_connections_mask & connection_bit) == 0,
++                "Static inter-mesh endpoint channel {} collides with an ordinary fabric connection on physical chip {}",
++                eth_channel_id,
++                physical_chip_id);
++
++            auto& worker_connection_info = fabric_worker_connections.read_only[eth_channel_id];
++            auto& dispatcher_connection_info = fabric_dispatcher_connections.read_only[eth_channel_id];
++            auto& tensix_connection_info = fabric_tensix_connections.read_only[eth_channel_id];
++            worker_connection_info.edm_direction = eth_chan_directions::EAST;
++            dispatcher_connection_info.edm_direction = eth_chan_directions::EAST;
++            tensix_connection_info.edm_direction = eth_chan_directions::EAST;
++            this->populate_fabric_connection_info(
++                worker_connection_info,
++                dispatcher_connection_info,
++                tensix_connection_info,
++                physical_chip_id,
++                eth_channel_id,
++                eth_chan_directions::Z);
++            if (router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::T3K_ENDPOINT &&
++                this->get_fabric_tensix_config() == tt::tt_fabric::FabricTensixConfig::DISABLED) {
++                // The terminal T3K channel map deliberately binds VC0 worker
++                // injection directly to ERISC channel 0 even when FabricTensix is
++                // enabled globally.  Do not publish the generic MUX entry here:
++                // its four-slot ring disagrees with the terminal ERISC's 16-slot
++                // ring and causes the consumer to skip three out of four packets.
++                // Control-plane connection tables are written before the endpoint
++                // builder creates its terminal (1 TX + 1 RX) allocator.  The
++                // generic Z-router config therefore still reports four slots here,
++                // although sender channel 0 has the same base/control addresses
++                // and the terminal allocator expands that ring to 16 slots.
++                constexpr uint8_t terminal_sender_slots = 16;
++                worker_connection_info.num_buffers_per_channel = terminal_sender_slots;
++                dispatcher_connection_info = worker_connection_info;
++                tensix_connection_info = worker_connection_info;
++            }
++            fabric_worker_connections.valid_connections_mask |= connection_bit;
++            fabric_dispatcher_connections.valid_connections_mask |= connection_bit;
++            fabric_tensix_connections.valid_connections_mask |= connection_bit;
++        }
++    }
++
+     const auto& fabric_tensix_config = this->get_fabric_tensix_config();
+     if (fabric_tensix_config == tt::tt_fabric::FabricTensixConfig::UDM) {
+         // UDM mode: use per-worker connections
+@@ -2184,6 +2250,56 @@ bool ControlPlane::is_cross_host_eth_link(ChipId chip_id, chan_id_t chan_id) con
+     return this->physical_system_descriptor_->is_cross_host_eth_link(tt::tt_metal::AsicID{asic_id}, chan_id);
+ }
+ 
++chan_id_t ControlPlane::get_static_intermesh_endpoint_eth_channel() const {
++    return get_static_intermesh_endpoint_eth_channel(0);
++}
++
++chan_id_t ControlPlane::get_static_intermesh_endpoint_eth_channel(uint32_t lane) const {
++    TT_FATAL(
++        fabric_router_config_.static_intermesh_endpoint_role != StaticIntermeshEndpointRole::DISABLED,
++        "Cannot resolve a static inter-mesh link for a disabled endpoint");
++
++    const auto physical_chip = fabric_router_config_.static_intermesh_endpoint_physical_chip;
++    const auto& remote_connections = cluster_.get().get_cluster_desc()->get_ethernet_connections_to_remote_devices();
++    const auto chip_it = remote_connections.find(physical_chip);
++    TT_FATAL(
++        chip_it != remote_connections.end(),
++        "No live cross-host Ethernet links found on static inter-mesh endpoint chip {}",
++        physical_chip);
++
++    std::vector<chan_id_t> channels;
++    channels.reserve(chip_it->second.size());
++    for (const auto& [channel, _] : chip_it->second) {
++        channels.push_back(static_cast<chan_id_t>(channel));
++    }
++    std::sort(channels.begin(), channels.end());
++
++    const auto link_count = fabric_router_config_.static_intermesh_endpoint_link_count;
++    TT_FATAL(link_count > 0, "Static inter-mesh endpoint link count must be positive");
++    TT_FATAL(
++        lane < link_count, "Static inter-mesh lane {} is out of range for configured link count {}", lane, link_count);
++    const auto link_index = fabric_router_config_.static_intermesh_endpoint_link_index + lane;
++    TT_FATAL(
++        link_index < channels.size(),
++        "Static inter-mesh link index {} is out of range for endpoint chip {} with {} live cross-host links",
++        link_index,
++        physical_chip,
++        channels.size());
++    return channels[link_index];
++}
++
++bool ControlPlane::is_static_intermesh_endpoint_eth_channel(chan_id_t channel) const {
++    if (fabric_router_config_.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::DISABLED) {
++        return false;
++    }
++    for (uint32_t lane = 0; lane < fabric_router_config_.static_intermesh_endpoint_link_count; ++lane) {
++        if (channel == get_static_intermesh_endpoint_eth_channel(lane)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ std::unordered_set<CoreCoord> ControlPlane::get_active_ethernet_cores(ChipId chip_id, bool skip_reserved_cores) const {
+     const auto& cluster = this->cluster_.get();
+ 
+@@ -2449,7 +2565,8 @@ void ControlPlane::populate_fabric_connection_info(
+     tt::tt_fabric::fabric_connection_info_t& dispatcher_connection_info,
+     tt::tt_fabric::fabric_connection_info_t& tensix_connection_info,
+     ChipId physical_chip_id,
+-    chan_id_t eth_channel_id) const {
++    chan_id_t eth_channel_id,
++    eth_chan_directions router_direction) const {
+     constexpr uint16_t WORKER_FREE_SLOTS_STREAM_ID =
+         tt::tt_fabric::connection_interface::sender_channel_0_free_slots_stream_id;
+     const auto& cluster = this->cluster_.get();
+@@ -2460,8 +2577,7 @@ void ControlPlane::populate_fabric_connection_info(
+ 
+     const auto& fabric_tensix_config = this->get_fabric_tensix_config();
+     // Always populate fabric router config for normal workers
+-    const auto& edm_config = builder_context.get_fabric_router_config(
+-        fabric_tensix_config, static_cast<eth_chan_directions>(sender_channel));
++    const auto& edm_config = builder_context.get_fabric_router_config(fabric_tensix_config, router_direction);
+     CoreCoord fabric_router_virtual_core = cluster.get_virtual_eth_core_from_channel(physical_chip_id, eth_channel_id);
+ 
+     fill_connection_info_fields(
+@@ -2947,8 +3063,7 @@ std::vector<PortDescriptor> ControlPlane::propose_port_descriptors_for_exit_node
+     // Build once outside the per-exit-node loop: mesh_edge_ports_to_chip_id[my_mesh_id] is
+     // constant throughout this function, so there is no need to re-sort on every iteration.
+     std::vector<std::pair<port_id_t, ChipId>> sorted_edge_ports(
+-        mesh_edge_ports_to_chip_id[*my_mesh_id].begin(),
+-        mesh_edge_ports_to_chip_id[*my_mesh_id].end());
++        mesh_edge_ports_to_chip_id[*my_mesh_id].begin(), mesh_edge_ports_to_chip_id[*my_mesh_id].end());
+     std::sort(sorted_edge_ports.begin(), sorted_edge_ports.end(), [](const auto& a, const auto& b) {
+         if (a.first.first != b.first.first) {
+             return static_cast<int>(a.first.first) < static_cast<int>(b.first.first);
+@@ -3182,8 +3297,7 @@ void ControlPlane::forward_descriptors_to_controller(
+         serialized_table = serialize_to_bytes(port_descriptors);
+         serialized_table_size = serialized_table.size();
+         distributed_context.send(
+-            ttsl::Span<std::byte>(
+-                reinterpret_cast<std::byte*>(&serialized_table_size), sizeof(serialized_table_size)),
++            ttsl::Span<std::byte>(reinterpret_cast<std::byte*>(&serialized_table_size), sizeof(serialized_table_size)),
+             Rank{CONTROLLER_RANK},
+             Tag{0});
+         distributed_context.send(
+@@ -3268,14 +3382,12 @@ void ControlPlane::forward_intermesh_connections_from_controller(AnnotatedInterm
+         }
+     } else {
+         distributed_context.recv(
+-            ttsl::Span<std::byte>(
+-                reinterpret_cast<std::byte*>(&serialized_table_size), sizeof(serialized_table_size)),
++            ttsl::Span<std::byte>(reinterpret_cast<std::byte*>(&serialized_table_size), sizeof(serialized_table_size)),
+             Rank{0},
+             Tag{1});
+         serialized_connections.resize(serialized_table_size);
+         distributed_context.recv(
+-            ttsl::as_writable_bytes(
+-                ttsl::Span<uint8_t>(serialized_connections.data(), serialized_connections.size())),
++            ttsl::as_writable_bytes(ttsl::Span<uint8_t>(serialized_connections.data(), serialized_connections.size())),
+             Rank{0},
+             Tag{1});
+         intermesh_connections = deserialize_intermesh_connections_from_bytes(serialized_connections);
+diff --git a/tt_metal/fabric/erisc_datamover_builder.cpp b/tt_metal/fabric/erisc_datamover_builder.cpp
+index 70df6af6e7d3dc5639e8587b1e75e87891e66810..bdf33c6b6ab8c865b6e802a61a9c2f4e72c8daff 100644
+--- a/tt_metal/fabric/erisc_datamover_builder.cpp
++++ b/tt_metal/fabric/erisc_datamover_builder.cpp
+@@ -19,6 +19,7 @@
+ #include <tt-metalium/tt_metal.hpp>
+ #include <algorithm>
+ #include <array>
++#include <bit>
+ #include <cstddef>
+ #include <iterator>
+ #include <numeric>
+@@ -455,11 +456,18 @@ FabricEriscDatamoverConfig::FabricEriscDatamoverConfig(
+         size_t{0},
+         [](size_t sum, const MemoryRegion& region) { return sum + region.get_size(); });
+ 
++    auto allocator_sender_channels = this->num_used_sender_channels_per_vc;
++    const auto& fabric_router_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    if (fabric_router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY &&
++        allocator_sender_channels[0] == 5 && allocator_sender_channels[1] == 0 && allocator_sender_channels[2] == 0) {
++        allocator_sender_channels[0] = 4;
++    }
++
+     // Create the static channel allocator with per-VC channel distribution
+     auto static_allocator = std::make_shared<tt::tt_fabric::FabricStaticSizedChannelsAllocator>(
+         topology,
+         options,
+-        this->num_used_sender_channels_per_vc,
++        allocator_sender_channels,
+         this->num_used_receiver_channels_per_vc,
+         this->channel_buffer_size_bytes,
+         available_channel_buffering_space,
+@@ -708,12 +716,74 @@ FabricEriscDatamoverBuilder::FabricEriscDatamoverBuilder(
+     // 1. The channel allocator was created with MAX channel counts
+     // 2. Changing config counts would cause emit_ct_args to emit wrong number of args
+     // The config stays at MAX, but we pass actual counts to device via compile-time args
++    const auto& router_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    const bool terminal_static_t3k =
++        router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::T3K_ENDPOINT &&
++        actual_sender_channels_per_vc.has_value() && actual_receiver_channels_per_vc.has_value() &&
++        actual_sender_channels_per_vc.value()[0] == 1 && actual_receiver_channels_per_vc.value()[0] == 1 &&
++        actual_sender_channels_per_vc.value()[1] == 0 && actual_receiver_channels_per_vc.value()[1] == 0 &&
++        actual_sender_channels_per_vc.value()[2] == 0 && actual_receiver_channels_per_vc.value()[2] == 0;
++    if (terminal_static_t3k) {
++        const auto available_channel_buffering_space = std::accumulate(
++            this->config.available_buffer_memory_regions.begin(),
++            this->config.available_buffer_memory_regions.end(),
++            size_t{0},
++            [](size_t sum, const MemoryRegion& region) { return sum + region.get_size(); });
++        const FabricEriscDatamoverOptions terminal_options{
++            .fabric_tensix_config = FabricTensixConfig::DISABLED,
++            .direction = direction,
++        };
++        auto terminal_allocator = std::make_shared<FabricStaticSizedChannelsAllocator>(
++            this->config.topology,
++            terminal_options,
++            actual_sender_channels_per_vc.value(),
++            actual_receiver_channels_per_vc.value(),
++            this->config.channel_buffer_size_bytes,
++            available_channel_buffering_space,
++            this->config.available_buffer_memory_regions);
++        this->config.channel_allocator = terminal_allocator;
++        this->config.remote_channels_allocator = std::make_shared<FabricRemoteChannelsAllocator>(*terminal_allocator);
++        this->config.num_used_sender_channels_per_vc = actual_sender_channels_per_vc.value();
++        this->config.num_used_receiver_channels_per_vc = actual_receiver_channels_per_vc.value();
++        this->config.num_used_sender_channels = 1;
++        this->config.num_used_receiver_channels = 1;
++        this->config.num_fwd_paths = 0;
++        sender_channel_is_traffic_injection_channel_array.resize(1);
++    }
++
++    const bool static_galaxy_fabric =
++        router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY;
++    if (static_galaxy_fabric && actual_sender_channels_per_vc.has_value() &&
++        actual_receiver_channels_per_vc.has_value()) {
++        // Host-side channel indices are dense for every router. The gateway's
++        // missing physical direction is restored only in the firmware CT mapping.
++        const auto available_channel_buffering_space = std::accumulate(
++            this->config.available_buffer_memory_regions.begin(),
++            this->config.available_buffer_memory_regions.end(),
++            size_t{0},
++            [](size_t sum, const MemoryRegion& region) { return sum + region.get_size(); });
++        const FabricEriscDatamoverOptions endpoint_options{
++            .fabric_tensix_config = FabricTensixConfig::DISABLED,
++            .direction = direction,
++        };
++        auto endpoint_allocator = std::make_shared<FabricStaticSizedChannelsAllocator>(
++            this->config.topology,
++            endpoint_options,
++            actual_sender_channels_per_vc.value(),
++            actual_receiver_channels_per_vc.value(),
++            this->config.channel_buffer_size_bytes,
++            available_channel_buffering_space,
++            this->config.available_buffer_memory_regions);
++        this->config.channel_allocator = endpoint_allocator;
++        this->config.remote_channels_allocator = std::make_shared<FabricRemoteChannelsAllocator>(*endpoint_allocator);
++    }
++
+     // Validate injection flags vector size matches the number of sender channels
+     TT_FATAL(
+-        sender_channel_is_traffic_injection_channel_array.size() == config.num_used_sender_channels,
++        sender_channel_is_traffic_injection_channel_array.size() == this->config.num_used_sender_channels,
+         "Internal error: injection_flags vector size {} does not match num_used_sender_channels {}",
+         sender_channel_is_traffic_injection_channel_array.size(),
+-        config.num_used_sender_channels);
++        this->config.num_used_sender_channels);
+ 
+     // Initialize per-RISC channel servicing flags
+     const auto& sender_counts = actual_sender_channels_per_vc.value_or(this->config.num_used_sender_channels_per_vc);
+@@ -771,11 +841,68 @@ FabricEriscDatamoverBuilder::FabricEriscDatamoverBuilder(
+         }
+     }
+ 
++    // A static cross-host endpoint is synthesized outside the control-plane graph. Channel trimming / variant
++    // derivation therefore cannot infer either its chip-local worker producer or its cross-host peer. VC0 channel 0
++    // is the fixed worker injection / link receive channel and must remain serviced in both directions.
++    const auto& static_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
++    const auto local_physical_chip_id = control_plane.get_physical_chip_id_from_fabric_node_id(local_fabric_node_id);
++    const bool is_static_endpoint =
++        static_config.static_intermesh_endpoint_role != StaticIntermeshEndpointRole::DISABLED &&
++        local_physical_chip_id == static_config.static_intermesh_endpoint_physical_chip &&
++        control_plane.is_static_intermesh_endpoint_eth_channel(my_eth_channel);
+     // Apply channel trimming overrides (from imported profile) after normal initialization
+     if (channel_trimming_overrides.has_value()) {
+         apply_channel_trimming_overrides(channel_trimming_overrides.value());
+     }
+ 
++    if (is_static_endpoint) {
++        for (size_t risc_id = 0; risc_id < num_riscv_cores; ++risc_id) {
++            this->is_sender_channel_serviced_[risc_id][0] = true;
++            this->is_receiver_channel_serviced_[risc_id][0] = true;
++        }
++    }
++    if (static_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY &&
++        local_physical_chip_id == static_config.static_intermesh_endpoint_physical_chip &&
++        actual_sender_channels_per_vc_.has_value() && actual_sender_channels_per_vc_.value()[0] == 4) {
++        const auto& mesh_graph = tt::tt_metal::MetalContext::instance().get_control_plane().get_mesh_graph();
++        const auto mesh_shape = mesh_graph.get_mesh_shape(local_fabric_node_id.mesh_id);
++        const auto mesh_coord =
++            mesh_graph.chip_to_coordinate(local_fabric_node_id.mesh_id, local_fabric_node_id.chip_id);
++        const uint32_t row_major_chip = static_cast<uint32_t>(mesh_coord[0]) * static_cast<uint32_t>(mesh_shape[1]) +
++                                        static_cast<uint32_t>(mesh_coord[1]);
++        const uint32_t skip_mask = builder_config::static_z_edge_skip_directions_bitmask(
++            row_major_chip, static_cast<uint32_t>(mesh_shape[0]), static_cast<uint32_t>(mesh_shape[1]));
++        TT_FATAL(std::popcount(skip_mask) == 1, "Static Galaxy endpoint must replace exactly one cardinal source");
++        const uint32_t skipped_direction = std::countr_zero(skip_mask);
++
++        if (this->direction_ == eth_chan_directions::Z) {
++            // Z router physical sources are E/W/N/S at channels 1..4.
++            static_galaxy_vc0_sender_hole_ = skipped_direction + 1;
++        } else {
++            // A mesh router already omits its own direction. Find the skipped
++            // direction's position in that router's original three-source list.
++            size_t original_internal = 1;
++            for (uint32_t direction = 0; direction < eth_chan_directions::Z; ++direction) {
++                if (direction == static_cast<uint32_t>(this->direction_)) {
++                    continue;
++                }
++                if (direction == skipped_direction) {
++                    static_galaxy_vc0_sender_hole_ = original_internal;
++                    break;
++                }
++                original_internal++;
++            }
++            TT_FATAL(
++                static_galaxy_vc0_sender_hole_.has_value(),
++                "Static Galaxy mesh router cannot replace its own direction");
++        }
++
++        for (size_t risc_id = 0; risc_id < num_riscv_cores; ++risc_id) {
++            this->is_sender_channel_serviced_[risc_id][*static_galaxy_vc0_sender_hole_] = false;
++            this->is_sender_channel_serviced_[risc_id][4] = true;
++        }
++    }
+     std::fill(
+         sender_channel_connection_liveness_check_disable_array.begin(),
+         sender_channel_connection_liveness_check_disable_array.end(),
+@@ -933,8 +1060,15 @@ FabricEriscDatamoverBuilder::CompileTimeArgs FabricEriscDatamoverBuilder::get_co
+ 
+     auto sender_channel_to_check = get_worker_connected_sender_channel();
+ 
++    const auto& endpoint_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    const bool is_static_endpoint =
++        endpoint_config.static_intermesh_endpoint_role != StaticIntermeshEndpointRole::DISABLED &&
++        local_physical_chip_id == endpoint_config.static_intermesh_endpoint_physical_chip &&
++        control_plane.is_static_intermesh_endpoint_eth_channel(this->my_eth_channel);
+     const auto remote_routing_direction =
+-        control_plane.get_forwarding_direction(this->peer_fabric_node_id, this->local_fabric_node_id);
++        is_static_endpoint
++            ? std::optional<RoutingDirection>{}
++            : control_plane.get_forwarding_direction(this->peer_fabric_node_id, this->local_fabric_node_id);
+ 
+     uint32_t remote_worker_sender_channel = 0;
+     bool skip_src_ch_id_update = false;
+@@ -986,7 +1120,13 @@ FabricEriscDatamoverBuilder::CompileTimeArgs FabricEriscDatamoverBuilder::get_co
+     // Get actual VC1 downstream EDM count from adapter (only relevant for multi-mesh 2D routing)
+     uint32_t num_vc1_downstream_edms =
+         needs_vc1 ? this->receiver_channel_to_downstream_adapter->get_downstream_edm_count_for_vc(1) : 0;
+-    bool z_router_enabled = fabric_context.has_z_router_on_device(control_plane, local_fabric_node_id);
++    const auto& static_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    const bool static_z_router_enabled =
++        static_config.static_intermesh_endpoint_role != StaticIntermeshEndpointRole::DISABLED &&
++        control_plane.get_physical_chip_id_from_fabric_node_id(local_fabric_node_id) ==
++            static_config.static_intermesh_endpoint_physical_chip;
++    bool z_router_enabled =
++        fabric_context.has_z_router_on_device(control_plane, local_fabric_node_id) || static_z_router_enabled;
+ 
+     log_debug(
+         LogFabric,
+@@ -1030,6 +1170,13 @@ FabricEriscDatamoverBuilder::CompileTimeArgs FabricEriscDatamoverBuilder::get_co
+     auto actual_sender_channels_vc2 = actual_sender_channels_per_vc_.has_value()
+                                           ? actual_sender_channels_per_vc_.value()[2]
+                                           : config.num_used_sender_channels_per_vc[2];
++    const bool static_galaxy_edge_layout =
++        endpoint_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY &&
++        local_physical_chip_id == endpoint_config.static_intermesh_endpoint_physical_chip &&
++        actual_sender_channels_vc0 == 4;
++    if (static_galaxy_edge_layout) {
++        actual_sender_channels_vc0 = 5;
++    }
+ 
+     auto should_force_internal_sender_skip = [&](size_t channel_id) -> bool {
+         if (channel_id >= num_sender_channels || channel_trimming_overrides_.has_value()) {
+@@ -1082,9 +1229,16 @@ FabricEriscDatamoverBuilder::CompileTimeArgs FabricEriscDatamoverBuilder::get_co
+     // shape, and optionally enable a terminal-only speedy receiver when the
+     // host has already proven that the exact peer on this link is the
+     // matching worker-only source router.
+-    const bool enable_speedy_vc0 = (actual_sender_channels_vc0 == 1 && !base_enable_deadlock_avoidance) ||
+-                                   vc0_is_worker_only_nonforwarding_after_trim ||
+-                                   vc0_enable_terminal_speedy_rx_after_trim;
++    const bool is_static_t3k_endpoint =
++        is_static_endpoint && static_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::T3K_ENDPOINT;
++    // Keep the static T3K endpoint on the regular receiver path. Its peer has
++    // only a seven-slot sender window, and the speedy receiver's deferred
++    // completion/fence behavior can consume packets without making the worker
++    // destination visible before that window drains.
++    const bool enable_speedy_vc0 =
++        !is_static_t3k_endpoint &&
++        ((actual_sender_channels_vc0 == 1 && !base_enable_deadlock_avoidance) ||
++         vc0_is_worker_only_nonforwarding_after_trim || vc0_enable_terminal_speedy_rx_after_trim);
+ 
+     // ===== Build named compile-time args (all non-pool/channel-mapping args) =====
+     std::unordered_map<std::string, uint32_t> named_args;
+@@ -1177,7 +1331,16 @@ FabricEriscDatamoverBuilder::CompileTimeArgs FabricEriscDatamoverBuilder::get_co
+     named_args["NUM_DS_OR_LOCAL_TENSIX_CONNECTIONS"] = this->num_downstream_tensix_connections;
+ 
+     // --- Main configuration args ---
+-    named_args["NUM_SENDER_CHANNELS"] = static_cast<uint32_t>(num_sender_channels);
++    // Ordinary Galaxy routers use the compact allocator extent. The configured
++    // gateway preserves five physical firmware positions over four host allocator entries.
++    const auto* kernel_static_allocator =
++        dynamic_cast<const FabricStaticSizedChannelsAllocator*>(config.channel_allocator.get());
++    const size_t kernel_num_sender_channels =
++        static_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY &&
++                kernel_static_allocator != nullptr
++            ? (static_galaxy_edge_layout ? num_sender_channels : kernel_static_allocator->get_num_sender_channels())
++            : num_sender_channels;
++    named_args["NUM_SENDER_CHANNELS"] = static_cast<uint32_t>(kernel_num_sender_channels);
+     named_args["NUM_RECEIVER_CHANNELS"] = static_cast<uint32_t>(num_receiver_channels);
+     named_args["NUM_DOWNSTREAM_CHANNELS"] = static_cast<uint32_t>(config.num_fwd_paths);
+     named_args["NUM_DOWNSTREAM_SENDERS_VC0"] = num_vc0_downstream_edms;
+@@ -1190,6 +1353,7 @@ FabricEriscDatamoverBuilder::CompileTimeArgs FabricEriscDatamoverBuilder::get_co
+     named_args["IS_INTERMESH_ROUTER"] = this->is_inter_mesh;
+     named_args["IS_HANDSHAKE_SENDER"] = is_handshake_master;
+     named_args["HANDSHAKE_ADDR"] = static_cast<uint32_t>(this->handshake_address);
++    named_args["REMOTE_HANDSHAKE_ADDR"] = static_cast<uint32_t>(this->handshake_address);
+     named_args["CHANNEL_BUFFER_SIZE"] = static_cast<uint32_t>(this->channel_buffer_size);
+     named_args["FABRIC_TENSIX_EXTENSION_MUX_MODE"] = this->has_tensix_extension;
+     named_args["ENABLE_FIRST_LEVEL_ACK_VC0"] = final_enable_first_level_ack_vc0 ? 1 : 0;
+@@ -1347,6 +1511,16 @@ FabricEriscDatamoverBuilder::CompileTimeArgs FabricEriscDatamoverBuilder::get_co
+     // forwarded-to capture together with locally-observed NOC writes when it is
+     // trustworthy and fall back to the safe non-speedy default otherwise.
+     auto compute_disable_rx_forwarding = [&](size_t vc) -> uint32_t {
++        if (is_static_endpoint && vc == 0) {
++            // `DISABLE_RX_CH0_FORWARDING` selects the local-only implementation
++            // inside the speedy RX helper.  In the regular receiver path it
++            // suppresses the local NoC write itself, so only assert it when the
++            // T3K endpoint actually uses that helper.
++            return static_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::T3K_ENDPOINT &&
++                           enable_speedy_vc0
++                       ? 1
++                       : 0;
++        }
+         if (vc == 0 && enable_speedy_vc0) {
+             return 1;
+         }
+@@ -1377,6 +1551,13 @@ FabricEriscDatamoverBuilder::CompileTimeArgs FabricEriscDatamoverBuilder::get_co
+             uint32_t sender_slots = static_cast<uint32_t>(static_alloc->get_sender_channel_number_of_slots(0));
+             receiver_amort_freq = std::max<uint32_t>(std::min<uint32_t>(4u, receiver_slots / 2), 1);
+             sender_amort_freq = std::max<uint32_t>(std::min<uint32_t>(2u, sender_slots / 2), 1);
++            if (is_static_endpoint &&
++                static_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::T3K_ENDPOINT) {
++                // The static Galaxy endpoint expands its worker-facing sender
++                // channel to eight slots, so four-packet completion batching is
++                // safe and avoids a reverse credit packet for every payload.
++                receiver_amort_freq = 4;
++            }
+         }
+     }
+     named_args["SENDER_CREDIT_AMORTIZATION_FREQUENCY"] = sender_amort_freq;
+@@ -1388,12 +1569,41 @@ FabricEriscDatamoverBuilder::CompileTimeArgs FabricEriscDatamoverBuilder::get_co
+     // Emit local channel allocations
+     auto* static_alloc_ptr = dynamic_cast<FabricStaticSizedChannelsAllocator*>(config.channel_allocator.get());
+     TT_FATAL(static_alloc_ptr != nullptr, "Channel allocator must be a FabricStaticSizedChannelsAllocator");
++    if (is_static_endpoint && risc_id == 0) {
++        TT_FATAL(
++            static_config.static_intermesh_peer_receiver_base_address != 0,
++            "Static inter-mesh endpoint requires a peer receiver base address");
++        config.remote_channels_allocator->set_remote_receiver_channel_base_address(
++            0, 0, static_config.static_intermesh_peer_receiver_base_address);
++        TT_FATAL(
++            static_config.static_intermesh_peer_receiver_num_slots != 0,
++            "Static inter-mesh endpoint requires a peer receiver slot count");
++        config.remote_channels_allocator->set_remote_receiver_channel_num_buffers(
++            0, 0, static_config.static_intermesh_peer_receiver_num_slots);
++        log_info(
++            tt::LogFabric,
++            "Static inter-mesh VC0 buffers: physical_chip={} eth_chan={} local_rx_base=0x{:08x} "
++            "local_rx_slots={} remote_rx_base=0x{:08x} remote_rx_slots={}",
++            local_physical_chip_id,
++            my_eth_channel,
++            static_alloc_ptr->get_receiver_channel_base_address(0, 0),
++            static_alloc_ptr->get_receiver_channel_number_of_slots(0, 0),
++            config.remote_channels_allocator->get_remote_receiver_channel_base_address(0, 0),
++            config.remote_channels_allocator->get_remote_receiver_channel_num_buffers(0, 0));
++    }
++    if (is_static_endpoint && risc_id != 0) {
++        config.remote_channels_allocator->set_remote_receiver_channel_base_address(
++            0, 0, static_config.static_intermesh_peer_receiver_base_address);
++        config.remote_channels_allocator->set_remote_receiver_channel_num_buffers(
++            0, 0, static_config.static_intermesh_peer_receiver_num_slots);
++    }
+     static_alloc_ptr->emit_channel_allocations_ct_args(
+         ct_args,
+         actual_sender_channels_vc0,
+         actual_sender_channels_vc1,
+         actual_sender_channels_vc2,
+-        num_receiver_channels);
++        num_receiver_channels,
++        static_galaxy_edge_layout ? static_galaxy_vc0_sender_hole_ : std::nullopt);
+ 
+     // Emit remote channel allocations
+     ct_args.push_back(0xabaddad6);
+@@ -1574,6 +1784,14 @@ FabricEriscDatamoverBuilder FabricEriscDatamoverBuilder::build(
+         *config.remote_channels_allocator);
+ 
+     if (build_in_worker_connection_mode) {
++        // This loop writes the receiver_channels_downstream_* arrays (sized max_downstream_edms)
++        // using num_max_receiver_channels as the bound. Safe today (3 <= 8) and pre-existing, but
++        // guard the relationship at compile time so a future constant bump can't reintroduce an
++        // out-of-bounds write here (same class of mismatch fixed above in get_runtime_args()).
++        static_assert(
++            builder_config::num_max_receiver_channels <= builder_config::max_downstream_edms,
++            "num_max_receiver_channels must fit within the max_downstream_edms-sized "
++            "receiver_channels_downstream_* arrays");
+         for (uint32_t i = 0; i < builder_config::num_max_receiver_channels; i++) {
+             receiver_channels_downstream_flow_control_semaphore_id[i] = 0;
+             receiver_channels_downstream_teardown_semaphore_id[i] = 0;
+diff --git a/tt_metal/fabric/erisc_datamover_builder.hpp b/tt_metal/fabric/erisc_datamover_builder.hpp
+index 2d62f195ed3d464e4e6a47cc64a393bb357f2bd3..6ffbfe8b9d5c3e9f32e5bba1d4ef27b9c7fd352b 100644
+--- a/tt_metal/fabric/erisc_datamover_builder.hpp
++++ b/tt_metal/fabric/erisc_datamover_builder.hpp
+@@ -636,6 +636,9 @@ public:
+     // Actual channel counts per VC for this specific router (may differ from config max)
+     std::optional<std::array<std::size_t, builder_config::MAX_NUM_VCS>> actual_sender_channels_per_vc_ = std::nullopt;
+     std::optional<std::array<std::size_t, builder_config::MAX_NUM_VCS>> actual_receiver_channels_per_vc_ = std::nullopt;
++    // Only populated on the Galaxy chip that owns the static Z link. It is the
++    // physical VC0 sender position replaced by Z on this particular router.
++    std::optional<size_t> static_galaxy_vc0_sender_hole_ = std::nullopt;
+     std::optional<Vc0TrimFastPathInfo> vc0_trim_fast_path_info_ = std::nullopt;
+ 
+     bool build_in_worker_connection_mode = false;
+diff --git a/tt_metal/fabric/fabric.cpp b/tt_metal/fabric/fabric.cpp
+index 2281892c25fe5af09c2891ce3bcef33dcc0f4994..a985b610e21bdb0ac07cdde1a854b096ba5fc764 100644
+--- a/tt_metal/fabric/fabric.cpp
++++ b/tt_metal/fabric/fabric.cpp
+@@ -29,6 +29,7 @@
+ #include "fabric_host_utils.hpp"
+ #include "fabric_context.hpp"
+ #include "fabric_builder_context.hpp"
++#include "tt_metal/fabric/builder/fabric_builder_config.hpp"
+ 
+ namespace tt::tt_metal {
+ class Program;
+@@ -74,6 +75,30 @@ size_t get_tt_fabric_max_payload_size_bytes() {
+     return control_plane.get_fabric_context().get_fabric_max_payload_size_bytes();
+ }
+ 
++FabricNodeId get_static_intermesh_endpoint_fabric_node_id() {
++    const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
++    const auto router_config = control_plane.get_fabric_router_config();
++    TT_FATAL(
++        router_config.static_intermesh_endpoint_role != StaticIntermeshEndpointRole::DISABLED,
++        "Cannot query the static inter-mesh endpoint when it is disabled");
++    return control_plane.get_fabric_node_id_from_physical_chip_id(
++        router_config.static_intermesh_endpoint_physical_chip);
++}
++
++tt::tt_metal::distributed::MeshCoordinate get_fabric_mesh_coordinate(const FabricNodeId& node_id) {
++    const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
++    return control_plane.get_mesh_graph().chip_to_coordinate(node_id.mesh_id, node_id.chip_id);
++}
++
++uint32_t get_static_intermesh_endpoint_link_count() {
++    const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
++    const auto router_config = control_plane.get_fabric_router_config();
++    TT_FATAL(
++        router_config.static_intermesh_endpoint_role != StaticIntermeshEndpointRole::DISABLED,
++        "Cannot query static inter-mesh link count when the endpoint is disabled");
++    return router_config.static_intermesh_endpoint_link_count;
++}
++
+ FabricNodeId get_fabric_node_id_from_physical_chip_id(ChipId physical_chip_id) {
+     const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
+     return control_plane.get_fabric_node_id_from_physical_chip_id(physical_chip_id);
+@@ -85,6 +110,27 @@ std::vector<chan_id_t> get_active_fabric_eth_routing_planes_in_direction(
+     return control_plane.get_active_fabric_eth_routing_planes_in_direction(fabric_node_id, routing_direction);
+ }
+ 
++tt::tt_metal::CoreCoord get_forwarding_eth_core(
++    const FabricNodeId& src_fabric_node_id, const FabricNodeId& dst_fabric_node_id, uint32_t link_idx) {
++    const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
++    auto forwarding_direction = control_plane.get_forwarding_direction(src_fabric_node_id, dst_fabric_node_id);
++    TT_FATAL(
++        forwarding_direction.has_value(),
++        "get_forwarding_eth_core: no forwarding direction from {} to {}",
++        src_fabric_node_id,
++        dst_fabric_node_id);
++    const auto candidate_eth_chans =
++        control_plane.get_active_fabric_eth_channels_in_direction(src_fabric_node_id, forwarding_direction.value());
++    TT_FATAL(
++        link_idx < candidate_eth_chans.size(),
++        "get_forwarding_eth_core: link_idx {} >= {} active channels",
++        link_idx,
++        candidate_eth_chans.size());
++    ChipId src_chip_id = control_plane.get_physical_chip_id_from_fabric_node_id(src_fabric_node_id);
++    return tt::tt_metal::MetalContext::instance().get_cluster().get_virtual_eth_core_from_channel(
++        src_chip_id, candidate_eth_chans[link_idx]);
++}
++
+ std::unordered_map<MeshId, MeshShape> get_physical_mesh_shapes() {
+     std::unordered_map<MeshId, MeshShape> mesh_shapes;
+     const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
+@@ -101,6 +147,33 @@ std::unordered_map<MeshId, MeshShape> get_physical_mesh_shapes() {
+ extern "C" void __emule_fabric_record_conn(uint32_t src, uint32_t wx, uint32_t wy, uint32_t dir, uint32_t neighbor);
+ #endif
+ 
++void append_static_intermesh_connection_rt_args(
++    chan_id_t fabric_router_channel,
++    tt::tt_metal::Program& worker_program,
++    const tt::tt_metal::CoreCoord& worker_core,
++    std::vector<uint32_t>& worker_args) {
++    const auto teardown_sem = tt_metal::CreateSemaphore(worker_program, {worker_core}, 0, CoreType::WORKER);
++    const auto buffer_index_sem = tt_metal::CreateSemaphore(worker_program, {worker_core}, 0, CoreType::WORKER);
++    append_worker_to_fabric_edm_sender_rt_args(fabric_router_channel, teardown_sem, buffer_index_sem, worker_args);
++}
++
++void append_static_intermesh_connection_rt_args(
++    tt::tt_metal::Program& worker_program,
++    const tt::tt_metal::CoreCoord& worker_core,
++    std::vector<uint32_t>& worker_args) {
++    append_static_intermesh_lane_connection_rt_args(0, worker_program, worker_core, worker_args);
++}
++
++void append_static_intermesh_lane_connection_rt_args(
++    uint32_t lane,
++    tt::tt_metal::Program& worker_program,
++    const tt::tt_metal::CoreCoord& worker_core,
++    std::vector<uint32_t>& worker_args) {
++    const auto endpoint_channel =
++        tt::tt_metal::MetalContext::instance().get_control_plane().get_static_intermesh_endpoint_eth_channel(lane);
++    append_static_intermesh_connection_rt_args(endpoint_channel, worker_program, worker_core, worker_args);
++}
++
+ template <typename ProgramOrDescriptor>
+ void append_fabric_connection_rt_args(
+     const FabricNodeId& src_fabric_node_id,
+diff --git a/tt_metal/fabric/fabric_builder.cpp b/tt_metal/fabric/fabric_builder.cpp
+index 11348d8dd8512679a5416e8d47f5d7a18682a138..7487300ba0429c6230bd0bf0a21d2b5442e2d09e 100644
+--- a/tt_metal/fabric/fabric_builder.cpp
++++ b/tt_metal/fabric/fabric_builder.cpp
+@@ -10,6 +10,7 @@
+ #include "impl/context/metal_context.hpp"
+ #include <tt-metalium/experimental/fabric/control_plane.hpp>
+ #include "dispatch/kernel_config/relay_mux.hpp"
++#include <limits>
+ #include <set>
+ 
+ namespace tt::tt_fabric {
+@@ -80,6 +81,28 @@ void FabricBuilder::discover_channels() {
+         }
+         control_plane.reserve_routing_planes(local_node_, direction, num_dispatch_links);
+     }
++
++    const auto& router_config = tt::tt_metal::MetalContext::instance().get_fabric_router_config();
++    if (router_config.static_intermesh_endpoint_role != StaticIntermeshEndpointRole::DISABLED &&
++        device_->id() == router_config.static_intermesh_endpoint_physical_chip) {
++        std::vector<chan_id_t> channels;
++        channels.reserve(router_config.static_intermesh_endpoint_link_count);
++        for (uint32_t lane = 0; lane < router_config.static_intermesh_endpoint_link_count; ++lane) {
++            const auto channel = control_plane.get_static_intermesh_endpoint_eth_channel(lane);
++            TT_FATAL(
++                !routers_.contains(channel), "Static inter-mesh channel {} collides with a fabric router", channel);
++            channels.push_back(channel);
++        }
++        channels_by_direction_[RoutingDirection::Z] = std::move(channels);
++        // Synthetic peer IDs also provide a deterministic cross-host handshake
++        // tie break: Galaxy is master, T3K is slave. They are never queried in CP.
++        const ChipId synthetic_peer =
++            router_config.static_intermesh_endpoint_role == StaticIntermeshEndpointRole::GALAXY_GATEWAY
++                ? std::numeric_limits<ChipId>::max()
++                : ChipId{0};
++        chip_neighbors_.insert_or_assign(
++            RoutingDirection::Z, FabricNodeId{local_node_.mesh_id, static_cast<std::uint32_t>(synthetic_peer)});
++    }
+ }
+ 
+ void FabricBuilder::create_routers() {
+diff --git a/tt_metal/fabric/fabric_builder_context.cpp b/tt_metal/fabric/fabric_builder_context.cpp
+index aada9f82173f07bce04c0540b3f00f9512fed675..5e93241e11772d4ed1001c81a3ef3bcd23c8fda2 100644
+--- a/tt_metal/fabric/fabric_builder_context.cpp
++++ b/tt_metal/fabric/fabric_builder_context.cpp
+@@ -32,7 +32,10 @@ void FabricBuilderContext::compute_max_channel_counts() {
+         false);
+ 
+     // If Z routers exist in this fabric, add Z_ROUTER mapping
+-    if (intermesh_vc_config_.router_type == IntermeshRouterType::Z_INTERMESH) {
++    const bool has_static_endpoint =
++        tt::tt_metal::MetalContext::instance().get_fabric_router_config().static_intermesh_endpoint_role !=
++        StaticIntermeshEndpointRole::DISABLED;
++    if (intermesh_vc_config_.router_type == IntermeshRouterType::Z_INTERMESH || has_static_endpoint) {
+         possible_mappings.emplace_back(
+             topology,
+             false,  // no tensix
+@@ -91,7 +94,8 @@ FabricBuilderContext::FabricBuilderContext(const FabricContext& fabric_context)
+     // Log trimming report after intermesh config is known (VC1 affects expected channel counts)
+     if (rtoptions.has_fabric_trimming_profile()) {
+         const auto& path = rtoptions.get_fabric_trimming_profile_path();
+-        generate_and_log_channel_trimming_report(path, fabric_context.get_fabric_topology(), intermesh_vc_config_.requires_vc1);
++        generate_and_log_channel_trimming_report(
++            path, fabric_context.get_fabric_topology(), intermesh_vc_config_.requires_vc1);
+     }
+ 
+     // Compute max channel counts for this fabric instance
+@@ -289,9 +293,15 @@ IntermeshVCConfig FabricBuilderContext::compute_intermesh_vc_config() const {
+             // deadlock-free (a fully deadlock-free implementation requires a dedicated pass-through VC).
+             const bool needs_mesh_pass_through =
+                 tt::tt_metal::MetalContext::instance().rtoptions().get_enable_fabric_mesh_pass_through();
++            const bool force_vc0_only =
++                tt::tt_metal::MetalContext::instance().get_fabric_router_config().intermesh_vc0_only;
++            TT_FATAL(
++                !(force_vc0_only && needs_mesh_pass_through),
++                "VC0-only inter-mesh routing cannot be combined with inter-mesh pass-through");
+ 
+-            config = needs_mesh_pass_through ? IntermeshVCConfig::full_mesh_with_pass_through()
+-                                             : IntermeshVCConfig::full_mesh();
++            config = force_vc0_only ? IntermeshVCConfig::vc0_only()
++                                    : (needs_mesh_pass_through ? IntermeshVCConfig::full_mesh_with_pass_through()
++                                                               : IntermeshVCConfig::full_mesh());
+ 
+             // Set router type based on detection
+             config.router_type = has_z_routers ? IntermeshRouterType::Z_INTERMESH : IntermeshRouterType::XY_INTERMESH;
+@@ -313,5 +323,4 @@ IntermeshVCConfig FabricBuilderContext::compute_intermesh_vc_config() const {
+     return config;
+ }
+ 
+-
+ }  // namespace tt::tt_fabric
+diff --git a/tt_metal/fabric/fabric_builder_context.hpp b/tt_metal/fabric/fabric_builder_context.hpp
+index 89d25b3287a69d47c6abcb958ab586ddd8ff3453..5389bdfda99af75f0d5b0a2af09224235ba3b268 100644
+--- a/tt_metal/fabric/fabric_builder_context.hpp
++++ b/tt_metal/fabric/fabric_builder_context.hpp
+@@ -20,15 +20,15 @@ namespace tt::tt_fabric {
+ 
+ class FabricContext;
+ 
+-
+ /**
+  * IntermeshVCMode - Defines intermesh VC requirements
+  */
+- enum class IntermeshVCMode : uint8_t {
+-    DISABLED,                      // No intermesh VC (single mesh or no intermesh connectivity)
+-    EDGE_ONLY,                     // Intermesh VC on edge nodes only (traffic sinks at mesh boundary)
+-    FULL_MESH,                     // Intermesh VC throughout mesh (traffic can traverse nodes within mesh)
+-    FULL_MESH_WITH_PASS_THROUGH    // Intermesh VC with inter-mesh pass-through (e.g., A→B→C routing)
++enum class IntermeshVCMode : uint8_t {
++    DISABLED,                    // No intermesh VC (single mesh or no intermesh connectivity)
++    VC0_ONLY,                    // Intermesh connectivity routed entirely on VC0
++    EDGE_ONLY,                   // Intermesh VC on edge nodes only (traffic sinks at mesh boundary)
++    FULL_MESH,                   // Intermesh VC throughout mesh (traffic can traverse nodes within mesh)
++    FULL_MESH_WITH_PASS_THROUGH  // Intermesh VC with inter-mesh pass-through (e.g., A→B→C routing)
+ };
+ 
+ /**
+@@ -39,9 +39,9 @@ class FabricContext;
+  * - XY_INTERMESH: Horizontal inter-mesh, requires 3 VC1 sender channels (mesh only)
+  */
+ enum class IntermeshRouterType : uint8_t {
+-    NONE,          // No intermesh connectivity
+-    Z_INTERMESH,   // Z routers (vertical device stacking)
+-    XY_INTERMESH   // XY intermesh routers (horizontal inter-mesh)
++    NONE,         // No intermesh connectivity
++    Z_INTERMESH,  // Z routers (vertical device stacking)
++    XY_INTERMESH  // XY intermesh routers (horizontal inter-mesh)
+ };
+ 
+ /**
+@@ -61,15 +61,19 @@ enum class IntermeshRouterType : uint8_t {
+ struct IntermeshVCConfig {
+     IntermeshVCMode mode = IntermeshVCMode::DISABLED;
+     IntermeshRouterType router_type = IntermeshRouterType::NONE;  // Type of intermesh router (Z vs XY)
+-    bool requires_vc1 = false;                      // True if VC1 needed for intermesh
+-    bool requires_vc1_full_mesh = false;            // True if VC1 needed throughout mesh (not just edges)
+-    bool requires_vc1_mesh_pass_through = false;    // True if VC1 must support inter-mesh pass-through
+-    bool requires_vc2 = false;                      // True if VC2 needed (Blackhole + 2D + no UDM/mux)
++    bool requires_vc1 = false;                                    // True if VC1 needed for intermesh
++    bool requires_vc1_full_mesh = false;                          // True if VC1 needed throughout mesh (not just edges)
++    bool requires_vc1_mesh_pass_through = false;                  // True if VC1 must support inter-mesh pass-through
++    bool requires_vc2 = false;                                    // True if VC2 needed (Blackhole + 2D + no UDM/mux)
+ 
+     IntermeshVCConfig() = default;
+ 
+-    static IntermeshVCConfig disabled() {
+-        return IntermeshVCConfig();
++    static IntermeshVCConfig disabled() { return IntermeshVCConfig(); }
++
++    static IntermeshVCConfig vc0_only() {
++        IntermeshVCConfig config;
++        config.mode = IntermeshVCMode::VC0_ONLY;
++        return config;
+     }
+ 
+     static IntermeshVCConfig edge_only() {
+@@ -180,7 +184,6 @@ public:
+     bool requires_vc2() const { return intermesh_vc_config_.requires_vc2; }
+ 
+ private:
+-
+     IntermeshVCConfig compute_intermesh_vc_config() const;
+ 
+     friend class FabricContext;
+diff --git a/tt_metal/fabric/fabric_edm_packet_header.hpp b/tt_metal/fabric/fabric_edm_packet_header.hpp
+index 6f87955731ef7a5a910a6cac767a4713fa279262..c81ae1931ff7b053a79afa039290669e022b1098 100644
+--- a/tt_metal/fabric/fabric_edm_packet_header.hpp
++++ b/tt_metal/fabric/fabric_edm_packet_header.hpp
+@@ -93,7 +93,7 @@ enum EDMStatus : uint32_t {
+     INITIALIZATION_COMPLETE = 0xBACADAEA
+ };
+ 
+-// 3 bits
++// 4 bits
+ enum NocSendType : uint8_t {
+     NOC_UNICAST_WRITE = 0,
+     NOC_UNICAST_INLINE_WRITE = 1,
+@@ -164,7 +164,6 @@ struct SparseMulticastRoutingCommandHeader {
+ struct NocUnicastCommandHeader {
+     uint64_t noc_address;
+ };
+-
+ // 2 bits
+ enum NocScatterWriteChunkEncoding : uint8_t {
+     CHUNK_ENCODING_NOP = 0,
+@@ -183,7 +182,6 @@ inline void set_chunk_encoding(uint8_t& chunk_encoding, NocScatterWriteChunkEnco
+     const uint8_t e = static_cast<uint8_t>(encoding);
+     chunk_encoding |= (e << (chunk_index * 2));
+ }
+-
+ #define NOC_SCATTER_WRITE_MAX_CHUNKS 4
+ static constexpr uint8_t NOC_SCATTER_WRITE_MIN_CHUNKS = 2;
+ struct NocUnicastScatterCommandHeader {
+diff --git a/tt_metal/fabric/fabric_router_channel_mapping.cpp b/tt_metal/fabric/fabric_router_channel_mapping.cpp
+index fdd0aac5e1a2ab849cc0140b73111190ce7cc09a..c2cc86acf3d81ed482a8ba58a64315bcd8ea48f0 100644
+--- a/tt_metal/fabric/fabric_router_channel_mapping.cpp
++++ b/tt_metal/fabric/fabric_router_channel_mapping.cpp
+@@ -8,6 +8,7 @@
+ #include <tt_stl/assert.hpp>
+ 
+ #include <vector>
++#include <bit>
+ namespace tt::tt_fabric {
+ 
+ FabricRouterChannelMapping::FabricRouterChannelMapping(
+@@ -15,12 +16,20 @@ FabricRouterChannelMapping::FabricRouterChannelMapping(
+     bool downstream_is_tensix_builder,
+     RouterVariant variant,
+     const IntermeshVCConfig* intermesh_config,
+-    bool has_z_on_device) :
++    bool has_z_on_device,
++    bool terminal_worker_only,
++    uint32_t z_vc0_skip_directions_bitmask,
++    uint32_t mesh_vc0_skip_directions_bitmask,
++    eth_chan_directions router_direction) :
+     topology_(topology),
+     downstream_is_tensix_builder_(downstream_is_tensix_builder),
+     variant_(variant),
+     intermesh_vc_config_(intermesh_config),
+-    has_z_on_device_(has_z_on_device) {
++    has_z_on_device_(has_z_on_device),
++    terminal_worker_only_(terminal_worker_only),
++    z_vc0_skip_directions_bitmask_(z_vc0_skip_directions_bitmask),
++    mesh_vc0_skip_directions_bitmask_(mesh_vc0_skip_directions_bitmask),
++    router_direction_(router_direction) {
+     initialize_mappings();
+ }
+ 
+@@ -34,11 +43,24 @@ void FabricRouterChannelMapping::initialize_vc0_mappings() {
+     const bool is_2d = is_2D_topology(topology_);
+ 
+     if (is_2d) {
++        if (terminal_worker_only_) {
++            sender_channel_map_[LogicalSenderChannelKey{0, 0}] = InternalSenderChannelMapping{BuilderType::ERISC, 0};
++            receiver_channel_map_[LogicalReceiverChannelKey{0, 0}] =
++                InternalReceiverChannelMapping{BuilderType::ERISC, 0};
++            return;
++        }
+         // 2D topology VC0 sender channels:
+         //   Z_ROUTER: 5 channels (0=Worker, 1-4=E/W/N/S)
+-        //   MESH: 4 channels (0=Worker, 1-3=mesh directions)
+-        auto num_sender_channels = is_z_router() ? builder_config::num_sender_channels_z_router_vc0  // 5 channels
+-                                                 : builder_config::num_sender_channels_2d_mesh;      // 4 channels
++        //   MESH with local Z: 5 channels (0=Worker, 1-3=mesh directions, 4=Z)
++        //   MESH without Z: 4 channels (0=Worker, 1-3=mesh directions)
++        auto num_sender_channels = (is_z_router() || has_z_on_device_)
++                                       ? builder_config::num_sender_channels_z_router_vc0
++                                       : builder_config::num_sender_channels_2d_mesh;
++        if (is_z_router() && z_vc0_skip_directions_bitmask_ != 0) {
++            num_sender_channels -= std::popcount(z_vc0_skip_directions_bitmask_);
++        } else if (is_mesh_router() && has_z_on_device_ && mesh_vc0_skip_directions_bitmask_ != 0) {
++            num_sender_channels -= std::popcount(mesh_vc0_skip_directions_bitmask_);
++        }
+ 
+         log_debug(
+             LogFabric,
+@@ -50,8 +72,47 @@ void FabricRouterChannelMapping::initialize_vc0_mappings() {
+         for (uint32_t i = 0; i < num_sender_channels; ++i) {
+             // When mux extension is enabled, ALL VC0 channels go to TENSIX mux
+             BuilderType builder_type = downstream_is_tensix_builder_ ? BuilderType::TENSIX : BuilderType::ERISC;
++            uint32_t internal_channel = i;
++            if (is_z_router() && z_vc0_skip_directions_bitmask_ != 0 && i > 0) {
++                uint32_t compact = 0;
++                for (uint32_t direction = 0; direction < eth_chan_directions::COUNT - 1; ++direction) {
++                    if (z_vc0_skip_directions_bitmask_ & (1u << direction)) {
++                        continue;
++                    }
++                    if (compact + 1 == i) {
++                        internal_channel = direction + 1;
++                        break;
++                    }
++                    compact++;
++                }
++            } else if (is_mesh_router() && has_z_on_device_ && mesh_vc0_skip_directions_bitmask_ != 0 && i > 0) {
++                TT_FATAL(
++                    router_direction_ < eth_chan_directions::Z,
++                    "Static mesh trim requires a cardinal router direction");
++                uint32_t compact = 1;
++                uint32_t original_internal = 1;
++                bool found = false;
++                for (uint32_t direction = 0; direction < eth_chan_directions::Z; ++direction) {
++                    if (direction == static_cast<uint32_t>(router_direction_)) {
++                        continue;
++                    }
++                    if ((mesh_vc0_skip_directions_bitmask_ & (1u << direction)) == 0) {
++                        if (compact == i) {
++                            internal_channel = original_internal;
++                            found = true;
++                            break;
++                        }
++                        compact++;
++                    }
++                    original_internal++;
++                }
++                if (!found) {
++                    // Z is always the final logical source and remains physical channel 4.
++                    internal_channel = builder_config::num_sender_channels_z_router_vc0 - 1;
++                }
++            }
+             sender_channel_map_[LogicalSenderChannelKey{0, i}] =
+-                InternalSenderChannelMapping{builder_type, i};
++                InternalSenderChannelMapping{builder_type, internal_channel};
+         }
+     } else if (topology_ == Topology::NeighborExchange) {
+         // Neighbor Exchange topology VC0 has 1 sender channel:
+@@ -82,6 +143,9 @@ void FabricRouterChannelMapping::initialize_vc1_mappings() {
+     }
+ 
+     if (is_z_router()) {
++        if (intermesh_vc_config_ != nullptr && !intermesh_vc_config_->requires_vc1) {
++            return;
++        }
+         // Z routers exist only for intermesh connectivity - validate config
+         TT_FATAL(
+             intermesh_vc_config_ != nullptr,
+@@ -202,9 +266,9 @@ uint32_t FabricRouterChannelMapping::get_num_virtual_channels() const {
+         return 3;
+     }
+ 
+-    // Z routers always have 2 VCs: VC0 (mesh traffic) and VC1 (Z traffic)
++    // Static endpoint Z routers deliberately contain VC0 only.
+     if (is_z_router()) {
+-        return 2;
++        return (intermesh_vc_config_ && intermesh_vc_config_->requires_vc1) ? 2 : 1;
+     }
+ 
+     // Check if intermesh VC is required (all routers get VC1 when enabled)
+@@ -221,16 +285,23 @@ uint32_t FabricRouterChannelMapping::get_num_sender_channels_for_vc(uint32_t vc)
+ 
+     switch (vc) {
+         case 0:  // VC0
++            if (terminal_worker_only_) {
++                return 1;  // Worker injection only; no cardinal/Z forwarding channels.
++            }
+             if (is_z_router()) {
+-                // Only Z routers have 5 VC0 channels (0=Worker, 1-4=E/W/N/S)
+-                return builder_config::num_sender_channels_z_router_vc0;  // 5 channels
++                return builder_config::num_sender_channels_z_router_vc0 - std::popcount(z_vc0_skip_directions_bitmask_);
+             } else {
+-                // All mesh routers (MESH and MESH_AND_Z_ROUTER) have 4 VC0 channels
+-                return builder_config::get_num_used_sender_channel_count(get_topology());  // 4 channels
++                // A mesh router on a Z-enabled endpoint needs one additional
++                // sender channel for MESH_TO_Z.
++                return has_z_on_device_ ? builder_config::num_sender_channels_z_router_vc0 -
++                                              std::popcount(mesh_vc0_skip_directions_bitmask_)
++                                        : builder_config::get_num_used_sender_channel_count(get_topology());
+             }
+         case 1:  // VC1
+             if (is_z_router()) {
+-                return builder_config::num_sender_channels_z_router_vc1;
++                return (intermesh_vc_config_ && intermesh_vc_config_->requires_vc1)
++                           ? builder_config::num_sender_channels_z_router_vc1
++                           : no_channels;
+             } else if (is_2D_topology(topology_)) {
+                 // Check if VC1 mappings were actually created in initialize_vc1_mappings()
+                 // Count how many sender channels exist for VC1
+diff --git a/tt_metal/fabric/fabric_router_channel_mapping.hpp b/tt_metal/fabric/fabric_router_channel_mapping.hpp
+index c93c9b60ad8a3b6913eafe8f0b91bbaa6e4cee6b..d2383e42fe6603cb205e4660dd2844ecabb3596b 100644
+--- a/tt_metal/fabric/fabric_router_channel_mapping.hpp
++++ b/tt_metal/fabric/fabric_router_channel_mapping.hpp
+@@ -85,7 +85,11 @@ public:
+         bool downstream_is_tensix_builder,
+         RouterVariant variant,
+         const IntermeshVCConfig* intermesh_config,
+-        bool has_z_on_device = false);
++        bool has_z_on_device = false,
++        bool terminal_worker_only = false,
++        uint32_t z_vc0_skip_directions_bitmask = 0,
++        uint32_t mesh_vc0_skip_directions_bitmask = 0,
++        eth_chan_directions router_direction = eth_chan_directions::COUNT);
+ 
+     /**
+      * Get the internal sender channel mapping for a logical sender channel
+@@ -119,12 +123,19 @@ public:
+      */
+     bool is_mesh_router() const;
+ 
++    uint32_t get_z_vc0_skip_directions_bitmask() const { return z_vc0_skip_directions_bitmask_; }
++    uint32_t get_mesh_vc0_skip_directions_bitmask() const { return mesh_vc0_skip_directions_bitmask_; }
++
+ private:
+     Topology topology_;
+     bool downstream_is_tensix_builder_;
+     RouterVariant variant_;
+     const IntermeshVCConfig* intermesh_vc_config_ = nullptr;
+     bool has_z_on_device_ = false;
++    bool terminal_worker_only_ = false;
++    uint32_t z_vc0_skip_directions_bitmask_ = 0;
++    uint32_t mesh_vc0_skip_directions_bitmask_ = 0;
++    eth_chan_directions router_direction_ = eth_chan_directions::COUNT;
+ 
+     std::map<LogicalSenderChannelKey, InternalSenderChannelMapping> sender_channel_map_;
+     std::map<LogicalReceiverChannelKey, InternalReceiverChannelMapping> receiver_channel_map_;
+diff --git a/tt_metal/fabric/fabric_tensix_builder_impl.cpp b/tt_metal/fabric/fabric_tensix_builder_impl.cpp
+index 9aba20ce459f9a5dd552d458377d3a8e730e4e86..55cecc6af7ec3778d044c3e26188e38120d8659c 100644
+--- a/tt_metal/fabric/fabric_tensix_builder_impl.cpp
++++ b/tt_metal/fabric/fabric_tensix_builder_impl.cpp
+@@ -461,7 +461,7 @@ std::vector<uint32_t> FabricTensixDatamoverMuxConfig::get_compile_time_args(
+     const auto& fabric_context = tt::tt_metal::MetalContext::instance().get_control_plane().get_fabric_context();
+     const auto& fabric_tensix_config = tt::tt_metal::MetalContext::instance().get_fabric_tensix_config();
+     const auto& fabric_router_config =
+-        fabric_context.get_builder_context().get_fabric_router_config(fabric_tensix_config);
++        fabric_context.get_builder_context().get_fabric_router_config(fabric_tensix_config, direction);
+ 
+     auto* channel_allocator = fabric_router_config.channel_allocator.get();
+     auto* const static_channel_allocator =
+diff --git a/tt_metal/fabric/hw/inc/edm_fabric/fabric_edge_node_router.hpp b/tt_metal/fabric/hw/inc/edm_fabric/fabric_edge_node_router.hpp
+index f19855480db2fde9466863fcb53a40f5e002f5db..3e886fed3de745de263d34502dfa2c9aed7b6e70 100644
+--- a/tt_metal/fabric/hw/inc/edm_fabric/fabric_edge_node_router.hpp
++++ b/tt_metal/fabric/hw/inc/edm_fabric/fabric_edge_node_router.hpp
+@@ -23,8 +23,13 @@ FORCE_INLINE uint32_t recompute_path(
+         fabric_set_unicast_route<true, static_cast<eth_chan_directions>(my_direction)>(
+             packet_header, packet_header->dst_start_chip_id, packet_header->dst_start_mesh_id);
+     }
+-    cached_routing_fields.hop_index = 0;
++    // fabric_set_*_route rebuilds both the route buffer and routing metadata
++    // (including the 2-D turn/branch offsets).  Forwarding below consumes the
++    // cached copy, so refresh the whole value rather than only its hop index.
++    // Updating just hop_index leaves stale metadata when a packet crosses a
++    // mesh boundary and is re-encoded by the ingress router.
+     packet_header->routing_fields.hop_index = 0;
++    cached_routing_fields = packet_header->routing_fields;
+     return (uint32_t)packet_header->route_buffer[0];
+ }
+ 
+diff --git a/tt_metal/fabric/hw/inc/edm_fabric/fabric_edm_packet_transmission.hpp b/tt_metal/fabric/hw/inc/edm_fabric/fabric_edm_packet_transmission.hpp
+index 27cfa9b1489b60f641e67a74c5cc66e2b09e18d0..ef8bfe9eef1393221ee8bd6e51ec52d75451ba1a 100644
+--- a/tt_metal/fabric/hw/inc/edm_fabric/fabric_edm_packet_transmission.hpp
++++ b/tt_metal/fabric/hw/inc/edm_fabric/fabric_edm_packet_transmission.hpp
+@@ -295,7 +295,6 @@ FORCE_INLINE
+                 ASSERT(false);
+             }
+         } break;
+-
+         case tt::tt_fabric::NocSendType::NOC_MULTICAST_WRITE:
+         case tt::tt_fabric::NocSendType::NOC_MULTICAST_ATOMIC_INC:
+         default: {
+diff --git a/tt_metal/fabric/hw/inc/edm_fabric/fabric_erisc_router_ct_args.hpp b/tt_metal/fabric/hw/inc/edm_fabric/fabric_erisc_router_ct_args.hpp
+index dd265f5531466a0f1f4a1363621fe4e7aa555e7c..33fa5becd01b34ff79abddb423c4efe504238666 100644
+--- a/tt_metal/fabric/hw/inc/edm_fabric/fabric_erisc_router_ct_args.hpp
++++ b/tt_metal/fabric/hw/inc/edm_fabric/fabric_erisc_router_ct_args.hpp
+@@ -128,6 +128,7 @@ constexpr bool enable_speedy_vc0 = NAMED_CT_ARG("ENABLE_SPEEDY_VC0") != 0;
+ constexpr bool is_intermesh_router = NAMED_CT_ARG("IS_INTERMESH_ROUTER");
+ constexpr bool is_handshake_sender = NAMED_CT_ARG("IS_HANDSHAKE_SENDER") != 0;
+ constexpr size_t handshake_addr = NAMED_CT_ARG("HANDSHAKE_ADDR");
++constexpr size_t remote_handshake_addr = NAMED_CT_ARG("REMOTE_HANDSHAKE_ADDR");
+ 
+ static_assert(fuse_receiver_flush_and_completion_ptr == 1, "fuse_receiver_flush_and_completion_ptr must be 0");
+ 
+diff --git a/tt_metal/fabric/hw/inc/edm_fabric/fabric_erisc_router_speedy_path.hpp b/tt_metal/fabric/hw/inc/edm_fabric/fabric_erisc_router_speedy_path.hpp
+index 4ecb9f87cfe5be748327655ea170e60904dba710..b4fbd281a56d500fe8604237548eda890e8061ed 100644
+--- a/tt_metal/fabric/hw/inc/edm_fabric/fabric_erisc_router_speedy_path.hpp
++++ b/tt_metal/fabric/hw/inc/edm_fabric/fabric_erisc_router_speedy_path.hpp
+@@ -45,6 +45,8 @@ struct SpeedyReceiverState {
+     uint8_t current_write_trid = RX_CH_TRID_STARTS[VC_ID];
+     uint8_t pending_flush_trid = RX_CH_TRID_STARTS[VC_ID] + 1;
+     uint32_t pending_flush_batch_count = 0;
++    uint8_t current_batch_src_ch_id = 0;
++    uint8_t pending_flush_src_ch_id = 0;
+     bool has_pending_flush = false;
+ };
+ 
+@@ -262,6 +264,13 @@ FORCE_INLINE bool run_receiver_channel_step_speedy(
+         // instead of two separate uncached L1 reads.
+         auto packed = PACKET_HEADER_TYPE::PackedPayloadAndSendType::load(packet_header);
+ 
++        const uint32_t current_batch_count =
++            receiver_state.unacked_sends -
++            (receiver_state.has_pending_flush ? receiver_state.pending_flush_batch_count : 0);
++        if (current_batch_count == 0) {
++            receiver_state.current_batch_src_ch_id = packet_header->src_ch_id;
++        }
++
+         execute_chip_unicast_to_local_chip_impl(
+             packet_header,
+             packed.payload_size_bytes,
+@@ -281,10 +290,10 @@ FORCE_INLINE bool run_receiver_channel_step_speedy(
+         receiver_state.unacked_sends++;
+     }
+ 
+-    // --- Ping-pong TRID flush ---
++    // --- Batched TRID flush ---
+     // All packets in a batch share a single TRID (receiver_state.current_write_trid). When the batch
+-    // threshold is hit, we flip to the other TRID and check the previous batch's single
+-    // TRID for completion — replacing the per-slot loop with a single register read.
++    // threshold is hit, advance through the receiver channel's TRID ring and check the previous batch's
++    // single TRID for completion — replacing the per-slot loop with a single register read.
+     //
+     // The pending TRID is checked eagerly (every call) to minimize credit return latency.
+     // Only the batch flip requires reaching the threshold.
+@@ -293,19 +302,23 @@ FORCE_INLINE bool run_receiver_channel_step_speedy(
+         !receiver_state.has_pending_flush) {
+         receiver_state.pending_flush_trid = receiver_state.current_write_trid;
+         receiver_state.pending_flush_batch_count = receiver_state.unacked_sends;
+-        receiver_state.current_write_trid = 1 - receiver_state.current_write_trid;
++        receiver_state.pending_flush_src_ch_id = receiver_state.current_batch_src_ch_id;
++        constexpr uint8_t trid_start = RX_CH_TRID_STARTS[VC_ID];
++        receiver_state.current_write_trid =
++            trid_start + ((receiver_state.current_write_trid - trid_start + 1) % NUM_TRANSACTION_IDS);
+         receiver_state.has_pending_flush = true;
+     }
+     if (receiver_state.has_pending_flush) {
+         bool flushed = ncrisc_noc_nonposted_write_with_transaction_id_sent(
+             tt::tt_fabric::edm_to_local_chip_noc, receiver_state.pending_flush_trid);
++        bool completion_txq_available = !internal_::eth_txq_is_busy(receiver_txq_id);
+ 
+-        if (flushed) {
++        if (flushed && completion_txq_available) {
+             auto& completion_counter = receiver_channel_pointers.completion_counter;
+             completion_counter.increment_n(receiver_state.pending_flush_batch_count);
+             receiver_send_completion_ack<false /*CHECK_BUSY*/>(
+                 receiver_channel_response_credit_sender,
+-                producer_sender_channel_index,
++                receiver_state.pending_flush_src_ch_id,
+                 receiver_state.pending_flush_batch_count);
+ 
+             receiver_state.unacked_sends -= receiver_state.pending_flush_batch_count;
+diff --git a/tt_metal/fabric/hw/inc/edm_fabric/fabric_router_eth_handshake.hpp b/tt_metal/fabric/hw/inc/edm_fabric/fabric_router_eth_handshake.hpp
+index 5824a3516b5cd091ee02c7202af0d4bdbf45fe24..b8c6be2538c6b19f3aeddbd69caa386998ef87fe 100644
+--- a/tt_metal/fabric/hw/inc/edm_fabric/fabric_router_eth_handshake.hpp
++++ b/tt_metal/fabric/hw/inc/edm_fabric/fabric_router_eth_handshake.hpp
+@@ -21,13 +21,14 @@ namespace handshake {
+ template <bool RISC_CPU_DATA_CACHE_ENABLED>
+ FORCE_INLINE void fabric_sender_side_handshake(
+     uint32_t handshake_register_address,
++    uint32_t remote_handshake_register_address,
+     uint16_t my_mesh_id,
+     uint8_t my_device_id,
+     volatile tt::tt_fabric::TerminationSignal* termination_signal_ptr,
+     size_t HS_CONTEXT_SWITCH_TIMEOUT = A_LONG_TIMEOUT_BEFORE_CONTEXT_SWITCH) {
+     volatile tt_l1_ptr handshake_info_t* handshake_info =
+         init_handshake_info(handshake_register_address, my_mesh_id, my_device_id);
+-    uint32_t local_val_addr = ((uint32_t)(&handshake_info->local_value)) / tt::tt_fabric::PACKET_WORD_SIZE_BYTES;
++    uint32_t remote_local_val_addr = remote_handshake_register_address / tt::tt_fabric::PACKET_WORD_SIZE_BYTES;
+     uint32_t scratch_addr = ((uint32_t)(&handshake_info->scratch)) / tt::tt_fabric::PACKET_WORD_SIZE_BYTES;
+     uint32_t count = 0;
+     while (handshake_info->local_value != MAGIC_HANDSHAKE_VALUE
+@@ -43,7 +44,7 @@ FORCE_INLINE void fabric_sender_side_handshake(
+ #endif
+         } else {
+             count++;
+-            internal_::eth_send_packet(0, scratch_addr, local_val_addr, 1);
++            internal_::eth_send_packet(0, scratch_addr, remote_local_val_addr, 1);
+         }
+         invalidate_l1_cache();
+     }
+@@ -52,13 +53,14 @@ FORCE_INLINE void fabric_sender_side_handshake(
+ template <bool RISC_CPU_DATA_CACHE_ENABLED>
+ FORCE_INLINE void fabric_receiver_side_handshake(
+     uint32_t handshake_register_address,
++    uint32_t remote_handshake_register_address,
+     uint16_t my_mesh_id,
+     uint8_t my_device_id,
+     volatile tt::tt_fabric::TerminationSignal* termination_signal_ptr,
+     size_t HS_CONTEXT_SWITCH_TIMEOUT = A_LONG_TIMEOUT_BEFORE_CONTEXT_SWITCH) {
+     volatile tt_l1_ptr handshake_info_t* handshake_info =
+         init_handshake_info(handshake_register_address, my_mesh_id, my_device_id);
+-    uint32_t local_val_addr = ((uint32_t)(&handshake_info->local_value)) / tt::tt_fabric::PACKET_WORD_SIZE_BYTES;
++    uint32_t remote_local_val_addr = remote_handshake_register_address / tt::tt_fabric::PACKET_WORD_SIZE_BYTES;
+     uint32_t scratch_addr = ((uint32_t)(&handshake_info->scratch)) / tt::tt_fabric::PACKET_WORD_SIZE_BYTES;
+     uint32_t count = 0;
+     while (handshake_info->local_value != MAGIC_HANDSHAKE_VALUE
+@@ -79,10 +81,10 @@ FORCE_INLINE void fabric_receiver_side_handshake(
+     }
+ #ifndef ARCH_WORMHOLE
+     if (!tt::tt_fabric::got_immediate_termination_signal<RISC_CPU_DATA_CACHE_ENABLED>(termination_signal_ptr)) {
+-        internal_::eth_send_packet(0, scratch_addr, local_val_addr, 1);
++        internal_::eth_send_packet(0, scratch_addr, remote_local_val_addr, 1);
+     }
+ #else
+-    internal_::eth_send_packet(0, scratch_addr, local_val_addr, 1);
++    internal_::eth_send_packet(0, scratch_addr, remote_local_val_addr, 1);
+ #endif
+ }
+ 
+diff --git a/tt_metal/fabric/hw/inc/tt_fabric_api.h b/tt_metal/fabric/hw/inc/tt_fabric_api.h
+index 2f5df03a989bc12b7b6f2e26c007629fbe271de3..ef2ce5650c9c246cb8a014971e8144e0dcb4f1ee 100644
+--- a/tt_metal/fabric/hw/inc/tt_fabric_api.h
++++ b/tt_metal/fabric/hw/inc/tt_fabric_api.h
+@@ -219,6 +219,14 @@ void fabric_set_mcast_route(volatile tt_l1_ptr HybridMeshPacketHeader* packet_he
+ }
+ #endif
+ 
++namespace static_intermesh_flags {
++// Divert a packet that reached its Galaxy gateway to that chip's Z EDM.
++constexpr uint8_t TUNNEL = 0x20;
++
++// Consume the route pre-encoded by the source after crossing the static cable.
++constexpr uint8_t ROUTE_SEEDED = 0x40;
++}  // namespace static_intermesh_flags
++
+ uint8_t get_router_direction(uint32_t eth_channel) {
+     tt_l1_ptr tensix_fabric_connections_l1_info_t* connection_info =
+         reinterpret_cast<tt_l1_ptr tensix_fabric_connections_l1_info_t*>(MEM_TENSIX_FABRIC_CONNECTIONS_BASE);
+@@ -316,6 +324,97 @@ bool fabric_set_unicast_route(
+     return ok;
+ }
+ 
++// Route through a gateway in the source mesh, then tunnel over its static
++// inter-mesh link.  The flag is consumed only by the gateway router.
++inline void fabric_set_static_intermesh_tunnel_route(
++    volatile tt_l1_ptr HybridMeshPacketHeader* packet_header, uint16_t gateway_dev_id, uint16_t mesh_id) {
++    fabric_set_unicast_route(packet_header, gateway_dev_id, mesh_id);
++    packet_header->is_mcast_active |= static_intermesh_flags::TUNNEL;
++}
++
++// Seed the route to use after a packet crosses a static inter-mesh link.  This
++// avoids recomputing the peer-mesh route on the endpoint ERISC.  The caller
++// supplies a route expressed from the peer endpoint to the final destination.
++inline void fabric_set_static_intermesh_preseeded_route_2d_galaxy(
++    volatile tt_l1_ptr HybridMeshPacketHeader* packet_header, uint16_t dst_dev_id, uint16_t dst_mesh_id) {
++    const uint8_t ns_hops = dst_dev_id / 4;
++    const uint8_t ew_hops = dst_dev_id % 4;
++    packet_header->dst_start_node_id = ((uint32_t)dst_mesh_id << 16) | (uint32_t)dst_dev_id;
++    packet_header->mcast_params_64 = 0;
++    packet_header->is_mcast_active = static_intermesh_flags::ROUTE_SEEDED;
++    packet_header->routing_fields.value = 0;
++    routing_encoding::encode_2d_unicast(
++        ns_hops,
++        ew_hops,
++        1,
++        1,
++        const_cast<uint8_t*>(packet_header->route_buffer),
++        FabricHeaderConfig::MESH_ROUTE_BUFFER_SIZE,
++        true);
++
++    const uint8_t turn_point = ns_hops + 1;
++    if (ns_hops > 0 && ew_hops > 0) {
++        packet_header->routing_fields.branch_east_offset = turn_point;
++    } else if (ns_hops > 0) {
++        packet_header->routing_fields.branch_east_offset = turn_point;
++        packet_header->routing_fields.branch_west_offset = turn_point;
++    } else if (ew_hops > 0) {
++        packet_header->routing_fields.branch_east_offset = 1;
++    }
++}
++
++// Set the response route from a host-packed word (protocol::pack_return_route): the Galaxy client
++// computes ns/ew hops+dirs and the dst chip in CONTROL-PLANE numbering, so this does NOT re-derive
++// them from dst_dev_id/4 (which assumes a 4-wide mesh with the gateway at (0,0)). The Server also
++// packs its provisional pre-ESTABLISH route in this format, so the format bit never aliases bit 15
++// of a raw 16-bit mesh ID.
++inline void fabric_set_static_intermesh_response_route_2d_galaxy(
++    volatile tt_l1_ptr HybridMeshPacketHeader* packet_header, uint32_t packed_route) {
++    // format bit = 1u << 31; layout matches the product protocol's pack_return_route.
++    ASSERT((packed_route & (1u << 31)) != 0);
++    const uint16_t dst_chip = static_cast<uint16_t>(packed_route & 0x1Fu);
++    const uint16_t dst_mesh = static_cast<uint16_t>((packed_route >> 5) & 0xFFFFu);
++    const uint8_t ns_hops = static_cast<uint8_t>((packed_route >> 21) & 0xFu);
++    const uint8_t ew_hops = static_cast<uint8_t>((packed_route >> 25) & 0xFu);
++    const uint8_t ns_dir = static_cast<uint8_t>((packed_route >> 29) & 1u);
++    const uint8_t ew_dir = static_cast<uint8_t>((packed_route >> 30) & 1u);
++    packet_header->dst_start_node_id = ((uint32_t)dst_mesh << 16) | (uint32_t)dst_chip;
++    packet_header->mcast_params_64 = 0;
++    packet_header->is_mcast_active = static_intermesh_flags::ROUTE_SEEDED;
++    packet_header->routing_fields.value = 0;
++    routing_encoding::encode_2d_unicast(
++        ns_hops,
++        ew_hops,
++        ns_dir,
++        ew_dir,
++        const_cast<uint8_t*>(packet_header->route_buffer),
++        FabricHeaderConfig::MESH_ROUTE_BUFFER_SIZE,
++        true);
++    // Branch offset = the hop at which the router substitutes hop_index when a NORTH/SOUTH trunk
++    // receiver turns onto the EW branch. The router reads branch_east_offset for an EAST turn but
++    // branch_west_offset for a WEST turn, so the offset MUST go to the field matching ew_dir. (The
++    // legacy preseeded route is south/east-only and only needs branch_east_offset; this response
++    // route carries real directions, so a WEST return path would otherwise turn on an unset offset.)
++    const uint8_t turn_point = ns_hops + 1;
++    const bool ew_east = (ew_dir == 1);
++    if (ns_hops > 0 && ew_hops > 0) {
++        if (ew_east) {
++            packet_header->routing_fields.branch_east_offset = turn_point;
++        } else {
++            packet_header->routing_fields.branch_west_offset = turn_point;
++        }
++    } else if (ns_hops > 0) {
++        packet_header->routing_fields.branch_east_offset = turn_point;
++        packet_header->routing_fields.branch_west_offset = turn_point;
++    } else if (ew_hops > 0) {
++        if (ew_east) {
++            packet_header->routing_fields.branch_east_offset = 1;
++        } else {
++            packet_header->routing_fields.branch_west_offset = 1;
++        }
++    }
++}
++
+ // Overload: For 1D LowLatencyPacketHeader
+ // 1D need to choose between target_as_dev true/false and compressed true/false
+ // TODO: compare performance of compressed true/false
+diff --git a/tt_metal/fabric/hw/inc/tt_fabric_mux_v2_sender.hpp b/tt_metal/fabric/hw/inc/tt_fabric_mux_v2_sender.hpp
+index 83228321c130c16f2ee119ae217a9eda2a0493f9..61311252b48b5b51fa6348da3395d3b56986d768 100644
+--- a/tt_metal/fabric/hw/inc/tt_fabric_mux_v2_sender.hpp
++++ b/tt_metal/fabric/hw/inc/tt_fabric_mux_v2_sender.hpp
+@@ -188,6 +188,21 @@ public:
+         }
+     }
+ 
++    // Compatibility with WorkerToFabricEdmSender call sites: reserve a mux
++    // channel slot, commit the packet, and wait until the local NoC copies into
++    // the mux-owned ring have completed.  Downstream EDM delivery remains
++    // asynchronous and is covered by the mux channel credits.
++    __attribute__((noinline, optimize("Oz"))) void send_payload_flush_blocking_from_address(
++        uint32_t source_address, size_t size_bytes) {
++        wait_for_empty_write_slot();
++        send_payload_flush_non_blocking_from_address(source_address, size_bytes);
++        noc_async_write_barrier(noc_index);
++    }
++
++    FORCE_INLINE void send_payload_blocking_from_address(uint32_t source_address, size_t size_bytes) {
++        send_payload_flush_blocking_from_address(source_address, size_bytes);
++    }
++
+     // --- Stateful send lane ---
+     // DATA cmd buf: mux slot destination. SYNC cmd buf: credit stream reg (-1).
+     // SYNC state is clobbered by noc_inline_dw_write / noc_semaphore_inc on write_at_cmd_buf.
+diff --git a/tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp b/tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+index d2856046c101797865a2a90a998dbf3b76f54e74..01fc59f4e6a567738c72ba897e6decd157843e1a 100644
+--- a/tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
++++ b/tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+@@ -326,6 +326,18 @@ static_assert(sender_channel_free_slots_stream_ids[5] == 27);
+ static_assert(sender_channel_free_slots_stream_ids[6] == 28);
+ static_assert(sender_channel_free_slots_stream_ids[7] == 29);
+ 
++// static edge compaction (Two FoRWarD): per-router skip-direction bitmask passed via static edge
++// compaction_SKIP_DIRECTIONS_BITMASK. Bit positions: 0=E, 1=W, 2=N, 3=S. A direction is skipped from the source channel
++// map when (a) it's a fabric mesh boundary (no neighbor chip), or (b) a static edge compaction-submesh boundary
++// (neighbor exists but lives in an adjacent submesh — forwarder source treated as dead, worker channel still usable
++// through the link). Defaults defined outside FABRIC_2D guard so 1D builds also see them; placed before all usages.
++#ifndef STATIC_Z_VC0_SKIP_DIRECTIONS_BITMASK
++#define STATIC_Z_VC0_SKIP_DIRECTIONS_BITMASK 0
++#endif
++#ifndef STATIC_MESH_VC0_SKIP_DIRECTIONS_BITMASK
++#define STATIC_MESH_VC0_SKIP_DIRECTIONS_BITMASK 0
++#endif
++
+ // For 2D fabric: maps compact index to downstream direction for each my_direction
+ // For 1D fabric: only 1 downstream direction per router (EAST forwards to WEST in 1D linear topology)
+ constexpr uint32_t MAX_DOWNSTREAM_EDM_COUNT = 4;
+@@ -353,6 +365,44 @@ constexpr uint32_t edm_index_to_edm_direction[eth_chan_directions::COUNT][MAX_DO
+      eth_chan_directions::SOUTH},  // Z router
+ };
+ 
++// Per-router compile-time arrays equivalent to edm_index_to_edm_direction[my_direction] and
++// direction_to_compact_index_map[my_direction] in baseline 4-ch mode, with additional skip-mask
++// filtering in static edge compaction mode. Defined unconditionally (mirroring baseline direction_to_compact_index_map)
++// so 1D paths that share helper functions compile cleanly.
++// Baseline (mask-independent) compact mapping. Must match host's
++// get_receiver_channel_compact_index() which encodes downstream connection bits in
++// has_downstream_edm using baseline ordering (self direction excluded only).
++//
++// static edge compaction's skip mask DOES NOT shift these compact indices. The mask only signals which
++// directions have no real connection (host doesn't set the bit), so the corresponding
++// kernel interface slot stays uninitialized and is never accessed at runtime.
++//
++// Applying mask filter here (as a former static edge compaction variant did) caused a 1-position downshift
++// of every direction after the masked one in the kernel's view, while host kept baseline
++// indexing — packets routed via the shifted slots landed on the wrong downstream router
++// (or uninitialized memory), producing a deterministic hang at the first intra-chip
++// transfer through a masked router (e.g. Galaxy 4x2 chip 4 N→S forward).
++constexpr auto build_my_edm_compact_to_direction() {
++    std::array<uint32_t, MAX_DOWNSTREAM_EDM_COUNT> arr = {};
++    size_t slot = 0;
++    for (uint32_t d = 0; d < eth_chan_directions::COUNT; d++) {
++        if (d == my_direction) {
++            continue;
++        }
++        if (slot < MAX_DOWNSTREAM_EDM_COUNT) {
++            arr[slot++] = d;
++        }
++    }
++    // Padding for unused slots — never read at runtime because iteration is bounded by
++    // has_downstream_edm bits actually set.
++    while (slot < MAX_DOWNSTREAM_EDM_COUNT) {
++        arr[slot++] = static_cast<uint32_t>(my_direction);
++    }
++    return arr;
++}
++constexpr std::array<uint32_t, MAX_DOWNSTREAM_EDM_COUNT> my_edm_compact_to_direction =
++    build_my_edm_compact_to_direction();
++
+ // sender_channel_free_slots_stream_ids[] mapping:
+ //   [0] → Local worker (always uses sender channel 0 on the outgoing router).
+ //   [1–3] → Sender channels 1–3 on the outgoing router, corresponding to
+@@ -380,16 +430,35 @@ constexpr uint32_t edm_index_to_edm_direction[eth_chan_directions::COUNT][MAX_DO
+ //         sender channel 2 (idx 1) ← West inbound
+ //         sender channel 3 (idx 2) ← North inbound
+ constexpr uint32_t get_vc0_downstream_sender_channel_free_slots_stream_id(uint32_t compact_index) {
+-    auto ds_edm_direction = edm_index_to_edm_direction[my_direction][compact_index];
+-    if (my_direction > ds_edm_direction) {
+-        // downstream sender channel = my_direction
+-        // stream id = sender_channel_free_slots_stream_ids[downstream sender channel]
+-        return sender_channel_free_slots_stream_ids[my_direction];
+-    } else {
+-        // downstream sender channel = my_direction + 1
+-        // stream id = sender_channel_free_slots_stream_ids[downstream sender channel]
+-        return sender_channel_free_slots_stream_ids[(1 + my_direction)];
++    auto ds_edm_direction = my_edm_compact_to_direction[compact_index];
++    // A Z router has one distinct sender channel on each cardinal downstream
++    // router.  RouterConnectionMapping::for_z_router() assigns those channels
++    // as EAST/WEST/NORTH/SOUTH -> 1/2/3/4.  The generic cardinal-router logic
++    // below searches for my_direction among cardinal directions; for Z it can
++    // never find a match and used to fall back to channel 1 for every target.
++    // That made the NoC destination point at (for example) sender channel 4
++    // while credit polling watched channel 1.
++    if constexpr (my_direction == eth_chan_directions::Z) {
++        // A mesh router that owns a local Z connection keeps Z in physical
++        // sender channel 4. Static edge trimming creates a hole in one of the
++        // cardinal positions; it does not compact this physical stream ID.
++        return sender_channel_free_slots_stream_ids[4];
++    }
++    // Downstream sender channel index in ds router's source map (self + all skip-mask
++    // directions excluded). Iterate cardinals to count how many come before my_direction.
++    // For intra-chip downstream this chip's skip mask applies. Inter-chip cases are conservative.
++    uint32_t ch = 0;
++    for (uint32_t d = 0; d < eth_chan_directions::COUNT - 1; d++) {
++        if (d == ds_edm_direction) {
++            continue;  // self of ds router
++        }
++        if (d == static_cast<uint32_t>(my_direction)) {
++            return sender_channel_free_slots_stream_ids[1 + ch];
++        }
++        ch++;
+     }
++    // my_direction is itself a skip direction from ds's POV — return ch 1 as a safe fallback.
++    return sender_channel_free_slots_stream_ids[1];
+ }
+ 
+ // VC1 downstream sender channel mapping (for inter-mesh routing)
+@@ -401,22 +470,26 @@ constexpr uint32_t get_vc0_downstream_sender_channel_free_slots_stream_id(uint32
+ //   [5] → VC1 channel 1 (compact index varies by direction)
+ //   [6] → VC1 channel 2 (compact index varies by direction)
+ constexpr uint32_t get_vc1_downstream_sender_channel_free_slots_stream_id(uint32_t compact_index) {
+-    auto ds_edm_direction = edm_index_to_edm_direction[my_direction][compact_index];
+-    if (my_direction > ds_edm_direction) {
+-        // downstream sender channel = 3 + my_direction (maps to channels 4-6)
+-        // stream id = sender_channel_free_slots_stream_ids[downstream sender channel]
+-        return sender_channel_free_slots_stream_ids[3 + my_direction];
+-    } else {
+-        // downstream sender channel = 4 + my_direction (maps to channels 4-6)
+-        // stream id = sender_channel_free_slots_stream_ids[downstream sender channel]
+-        return sender_channel_free_slots_stream_ids[4 + my_direction];
++    auto ds_edm_direction = my_edm_compact_to_direction[compact_index];
++    // VC1 channel count is not reduced by static edge compaction, but the source-map skip mask still affects
++    // the slot index. Mirror the VC0 iteration logic, then offset by VC0 channel count (3).
++    uint32_t ch_offset = 0;
++    for (uint32_t d = 0; d < eth_chan_directions::COUNT - 1; d++) {
++        if (d == ds_edm_direction) {
++            continue;
++        }
++        if (d == static_cast<uint32_t>(my_direction)) {
++            return sender_channel_free_slots_stream_ids[3 + 1 + ch_offset];
++        }
++        ch_offset++;
+     }
++    return sender_channel_free_slots_stream_ids[3 + 1];
+ }
+ #endif
+ 
+ FORCE_INLINE constexpr eth_chan_directions map_compact_index_to_direction(size_t compact_index) {
+ #if defined(FABRIC_2D)
+-    return static_cast<eth_chan_directions>(edm_index_to_edm_direction[my_direction][compact_index]);
++    return static_cast<eth_chan_directions>(my_edm_compact_to_direction[compact_index]);
+ #else
+     return static_cast<eth_chan_directions>(compact_index);
+ #endif
+@@ -461,13 +534,31 @@ constexpr size_t direction_to_compact_index_map[eth_chan_directions::COUNT][eth_
+     {0, 1, 2, 3, 0},  // Z router -> EAST, WEST, NORTH, SOUTH
+ };
+ 
++// Direction→compact-index lookup for THIS router (my_direction excluded). Defined outside the
++// FABRIC_2D guard so 1D builds also have it (map_downstream_direction_to_compact_index() below
++// references it unconditionally).
++constexpr auto build_my_direction_to_compact_index() {
++    std::array<size_t, eth_chan_directions::COUNT> arr = {};
++    size_t slot = 0;
++    for (uint32_t d = 0; d < eth_chan_directions::COUNT; d++) {
++        if (d == my_direction) {
++            arr[d] = 0;
++            continue;
++        }
++        arr[d] = slot++;
++    }
++    return arr;
++}
++constexpr std::array<size_t, eth_chan_directions::COUNT> my_direction_to_compact_index =
++    build_my_direction_to_compact_index();
++
+ template <eth_chan_directions downstream_direction>
+ FORCE_INLINE constexpr size_t map_downstream_direction_to_compact_index() {
+-    return direction_to_compact_index_map[my_direction][downstream_direction];
++    return my_direction_to_compact_index[downstream_direction];
+ }
+ 
+ FORCE_INLINE constexpr size_t map_downstream_direction_to_compact_index(eth_chan_directions downstream_direction) {
+-    return direction_to_compact_index_map[my_direction][downstream_direction];
++    return my_direction_to_compact_index[downstream_direction];
+ }
+ 
+ // Convert a hop_cmd direction bitmask into a sender channel bitmask using dense channel packing.
+@@ -475,6 +566,8 @@ FORCE_INLINE constexpr size_t map_downstream_direction_to_compact_index(eth_chan
+ // and the corresponding sender channel is compact_index + 1 (channel 0 is always worker).
+ // my_direction is masked out since it represents a local write, not a forwarding channel.
+ FORCE_INLINE uint16_t hop_cmd_to_sender_channel_mask(uint32_t hop_cmd) {
++    // static edge compaction: skip directions have no available sender channel mapping on this router. Mask them
++    // out so a routing-error hop_cmd doesn't get mapped to ch 1 silently.
+     uint32_t fwd_directions = hop_cmd & ~(1u << my_direction);
+     uint16_t fwd_mask = 0;
+     constexpr size_t num_directions = z_router_enabled ? eth_chan_directions::COUNT : eth_chan_directions::COUNT - 1;
+@@ -915,7 +1008,6 @@ FORCE_INLINE void forward_to_local_destination(
+         execute_chip_unicast_to_local_chip(packet_start, payload_size_bytes, transaction_id, rx_channel_id);
+     }
+ }
+-
+ // !!!WARNING!!! - MAKE SURE CONSUMER HAS SPACE BEFORE CALLING
+ template <uint8_t rx_channel_id, size_t DOWNSTREAM_EDM_SIZE, typename DownstreamSenderT, typename LocalRelayInterfaceT>
+ #if !defined(FABRIC_2D_VC1_ACTIVE)
+@@ -929,6 +1021,7 @@ FORCE_INLINE
+         LocalRelayInterfaceT& local_relay_interface,
+         uint8_t transaction_id,
+         uint32_t hop_cmd) {
++
+     uint16_t payload_size_bytes = packet_start->payload_size_bytes;
+ 
+     using eth_chan_directions::EAST;
+@@ -1852,26 +1945,63 @@ FORCE_INLINE bool run_receiver_channel_step_impl(
+         if constexpr (!skip_src_ch_id_update && !enable_first_level_ack) {
+             receiver_channel_pointers.set_src_chan_id(receiver_buffer_index, packet_header->src_ch_id);
+         }
+-        uint32_t hop_cmd;
++        uint32_t hop_cmd = 0;
+         bool can_send_to_all_local_chip_receivers;
++#if defined(STATIC_INTERMESH_GALAXY_LINK)
++        bool static_link_local = false;
++#endif
++#if defined(STATIC_INTERMESH_T3K_LINK)
++        if constexpr (udm_mode) {
++            can_send_to_all_local_chip_receivers =
++                local_relay_interface.template edm_has_space_for_packet<ENABLE_RISC_CPU_DATA_CACHE>();
++        } else {
++            can_send_to_all_local_chip_receivers = true;
++        }
++#else
++#if defined(STATIC_INTERMESH_LINK_ENDPOINT)
++        if constexpr (is_2d_fabric) {
++#if defined(STATIC_INTERMESH_GALAXY_LINK)
++            if (packet_header->dst_start_mesh_id != routing_table.my_mesh_id ||
++                packet_header->dst_start_chip_id != routing_table.my_device_id) {
++                if ((packet_header->is_mcast_active & tt::tt_fabric::static_intermesh_flags::ROUTE_SEEDED) != 0) {
++                    packet_header->is_mcast_active &=
++                        static_cast<uint8_t>(~tt::tt_fabric::static_intermesh_flags::ROUTE_SEEDED);
++                    cached_routing_fields = packet_header->routing_fields;
++                    hop_cmd = packet_header->route_buffer[cached_routing_fields.hop_index];
++                } else {
++                    // Compatibility path for callers that only preserve the
++                    // final destination across the static cable.
++                    hop_cmd = recompute_path(packet_header, cached_routing_fields, routing_table);
++                }
++            } else {
++                hop_cmd = get_cmd_with_mesh_boundary_adjustment(packet_header, cached_routing_fields, routing_table);
++            }
++#else
++            hop_cmd = get_cmd_with_mesh_boundary_adjustment(packet_header, cached_routing_fields, routing_table);
++#endif
++            static_link_local = hop_cmd == MeshRoutingFields::NOOP;
++            if (static_link_local) {
++                if constexpr (udm_mode) {
++                    can_send_to_all_local_chip_receivers =
++                        local_relay_interface.template edm_has_space_for_packet<ENABLE_RISC_CPU_DATA_CACHE>();
++                } else {
++                    can_send_to_all_local_chip_receivers = true;
++                }
++            } else {
++                can_send_to_all_local_chip_receivers =
++                    can_forward_packet_completely<DownstreamSenderT, LocalRelayInterfaceT, DOWNSTREAM_EDM_SIZE>(
++                        hop_cmd, downstream_edm_interfaces, local_relay_interface);
++            }
++        }
++#else
+         if constexpr (is_2d_fabric) {
+-            // read in the hop command from route buffer.
+-            // Hop command is 4 bits. Each of the 4 bits signal one of the 4 possible outcomes for a packet.
+-            // [0]->Forward East
+-            // [1]->Forward West
+-            // [2]->Forward North
+-            // [3]->Forward South
+-            // The hop command (4-bits) gets decoded as a local write and/or forward to the "other" 3 directions.
+-            // Other 3 directions depend on the direction of fabric router.
+-            // For example, a router that is connected West can write locally or forard East, North or South.
+-            // A local write is encoded by setting the bit corresponding to fabric router's own direction to 1.
+-            // For a West facing fabric router:
+-            //  - Hop command of [0010] instructs fabric router to write the packet locally.
+-            //  - Hop command of [0011] instructs fabric router to write the packet locally AND forward East (a line
+-            //  mcast)
+ #if defined(FABRIC_2D)
+-            // need this ifdef since the packet header for 1D does not have router_buffer field in it.
+             hop_cmd = get_cmd_with_mesh_boundary_adjustment(packet_header, cached_routing_fields, routing_table);
++#if defined(STATIC_INTERMESH_GALAXY_GATEWAY)
++            if ((packet_header->is_mcast_active & tt::tt_fabric::static_intermesh_flags::TUNNEL) != 0) {
++                hop_cmd = MeshRoutingFields::NOOP;
++            }
++#endif
+             can_send_to_all_local_chip_receivers =
+                 can_forward_packet_completely<DownstreamSenderT, LocalRelayInterfaceT, DOWNSTREAM_EDM_SIZE>(
+                     hop_cmd, downstream_edm_interfaces, local_relay_interface);
+@@ -1882,6 +2012,8 @@ FORCE_INLINE bool run_receiver_channel_step_impl(
+                 can_forward_packet_completely(cached_routing_fields, downstream_edm_interfaces[0]);
+ #endif
+         }
++#endif
++#endif
+         if constexpr (enable_trid_flush_check_on_noc_txn) {
+             bool trid_flushed = receiver_channel_trid_tracker.transaction_flushed(receiver_buffer_index);
+             can_send_to_all_local_chip_receivers &= trid_flushed;
+@@ -1897,6 +2029,23 @@ FORCE_INLINE bool run_receiver_channel_step_impl(
+             if constexpr (!is_receiver_channel_forwarding_disabled[receiver_channel]) {
+                 uint8_t trid = receiver_channel_trid_tracker.update_buffer_slot_to_next_trid_and_advance_trid_counter(
+                     receiver_buffer_index);
++#if defined(STATIC_INTERMESH_T3K_LINK)
++                forward_to_local_destination<receiver_channel>(
++                    local_relay_interface, packet_header, packet_header->payload_size_bytes, trid);
++#elif defined(STATIC_INTERMESH_LINK_ENDPOINT)
++                if (static_link_local) {
++                    forward_to_local_destination<receiver_channel>(
++                        local_relay_interface, packet_header, packet_header->payload_size_bytes, trid);
++                } else {
++                    receiver_forward_packet<receiver_channel, DOWNSTREAM_EDM_SIZE>(
++                        packet_header,
++                        cached_routing_fields,
++                        downstream_edm_interfaces,
++                        local_relay_interface,
++                        trid,
++                        hop_cmd);
++                }
++#else
+                 if constexpr (is_2d_fabric) {
+ #if defined(FABRIC_2D)
+                     receiver_forward_packet<receiver_channel, DOWNSTREAM_EDM_SIZE>(
+@@ -1913,6 +2062,7 @@ FORCE_INLINE bool run_receiver_channel_step_impl(
+                         packet_header, cached_routing_fields, downstream_edm_interfaces[0], trid);
+ #endif
+                 }
++#endif
+             }
+             wr_sent_counter.increment();
+             // decrement the to_receiver_pkts_sent_id stream register by 1 since current packet has been processed.
+@@ -1954,6 +2104,45 @@ FORCE_INLINE bool run_receiver_channel_step_impl(
+         // flush and completion are fused, so we only need to update one of the counters
+         // update completion since other parts of the code check against completion
+         auto& completion_counter = receiver_channel_pointers.completion_counter;
++#if defined(STATIC_INTERMESH_GALAXY_LINK) || defined(STATIC_INTERMESH_T3K_LINK)
++        // The static cable has one upstream sender.  Returning one Ethernet
++        // credit packet per 4 KiB payload serializes ACK traffic with the data
++        // stream and cuts forwarding throughput roughly in half.  Find the
++        // contiguous flushed prefix and return it with one counted credit.
++        uint32_t completed_batch = 0;
++        auto probe_counter = completion_counter;
++        const uint32_t pending_count = completion_counter.distance_behind(wr_sent_counter);
++        const auto first_buffer_index = completion_counter.get_buffer_index();
++        const uint8_t batch_src_ch_id = skip_src_ch_id_update
++                                            ? receiver_channel_pointers.get_src_chan_id()
++                                            : receiver_channel_pointers.get_src_chan_id(first_buffer_index);
++        while (completed_batch < pending_count) {
++            auto receiver_buffer_index = probe_counter.get_buffer_index();
++            if (!receiver_channel_trid_tracker.transaction_flushed(receiver_buffer_index)) {
++                break;
++            }
++            if constexpr (!skip_src_ch_id_update) {
++                if (receiver_channel_pointers.get_src_chan_id(receiver_buffer_index) != batch_src_ch_id) {
++                    break;
++                }
++            }
++            probe_counter.increment();
++            completed_batch++;
++        }
++        bool can_send_completion = completed_batch != 0;
++        if constexpr (!ETH_TXQ_SPIN_WAIT_RECEIVER_SEND_COMPLETION_ACK) {
++            can_send_completion = can_send_completion && !internal_::eth_txq_is_busy(receiver_txq_id);
++        }
++        if (can_send_completion) {
++            receiver_send_completion_ack<ETH_TXQ_SPIN_WAIT_RECEIVER_SEND_COMPLETION_ACK>(
++                receiver_channel_response_credit_sender, batch_src_ch_id, completed_batch);
++            for (uint32_t i = 0; i < completed_batch; ++i) {
++                auto receiver_buffer_index = completion_counter.get_buffer_index();
++                receiver_channel_trid_tracker.clear_trid_at_buffer_slot(receiver_buffer_index);
++                completion_counter.increment();
++            }
++        }
++#else
+         // Currently unclear if it's better to loop here or not...
+         bool unflushed_writes = !completion_counter.is_caught_up_to(wr_sent_counter);
+         auto receiver_buffer_index = completion_counter.get_buffer_index();
+@@ -1974,6 +2163,7 @@ FORCE_INLINE bool run_receiver_channel_step_impl(
+             receiver_channel_trid_tracker.clear_trid_at_buffer_slot(receiver_buffer_index);
+             completion_counter.increment();
+         }
++#endif
+     }
+     return progress;
+ };
+@@ -2249,7 +2439,6 @@ FORCE_INLINE void run_fabric_edm_main_loop(
+     constexpr uint32_t FABRIC_KERNEL_HEARTBEAT_ADDR = 0x1F80;
+ #endif
+     volatile uint32_t* fabric_heartbeat_ptr = reinterpret_cast<volatile uint32_t*>(FABRIC_KERNEL_HEARTBEAT_ADDR);
+-
+     auto execute_main_loop = [&]() {
+         ActualSpeedySenderState<super_speedy_mode> local_speedy_sender_state;
+         ActualSpeedyReceiverState<super_speedy_mode, 0> local_speedy_receiver_state;
+@@ -2772,8 +2961,7 @@ typename std::enable_if<(I >= NUM_SENDER_CHANNELS), void>::type init_sender_chan
+ }
+ 
+ template <size_t NUM_SENDER_CHANNELS, typename EdmChannelWorkerIFs>
+-__attribute__((optimize("Os")))
+-void
++__attribute__((optimize("Os"))) void
+ #ifdef FABRIC_2D
+     __attribute__((noinline))
+ #endif
+@@ -3530,9 +3718,19 @@ void kernel_main() {
+         wait_for_other_local_erisc();
+     }
+     if constexpr (enable_ethernet_handshake) {
++#if defined(STATIC_INTERMESH_LINK_ENDPOINT) && defined(ARCH_WORMHOLE)
++        // This external link is retrained by legacy ETH firmware immediately
++        // before the fabric router takes ownership.  A completed legacy TX can
++        // leave TXQ0's command latch non-zero across the firmware handoff,
++        // causing the first fabric handshake packet to wait forever.  No
++        // fabric traffic exists yet, so explicitly return the dedicated queue
++        // to its idle state before beginning the handshake.
++        eth_txq_reg_write(0, ETH_TXQ_CMD, 0);
++#endif
+         if constexpr (is_handshake_sender) {
+             erisc::datamover::handshake::fabric_sender_side_handshake<ENABLE_RISC_CPU_DATA_CACHE>(
+                 handshake_addr,
++                remote_handshake_addr,
+                 routing_table_l1->my_mesh_id,
+                 routing_table_l1->my_device_id,
+                 termination_signal_ptr,
+@@ -3540,6 +3738,7 @@ void kernel_main() {
+         } else {
+             erisc::datamover::handshake::fabric_receiver_side_handshake<ENABLE_RISC_CPU_DATA_CACHE>(
+                 handshake_addr,
++                remote_handshake_addr,
+                 routing_table_l1->my_mesh_id,
+                 routing_table_l1->my_device_id,
+                 termination_signal_ptr,
+diff --git a/tt_metal/fabric/routing_table_generator.cpp b/tt_metal/fabric/routing_table_generator.cpp
+index 6b7a3446dd1d1ae5a6ee0c1c0854fea239c98fa5..b24c06636259d1153ef4bfd7cf46f28c4657eb8a 100644
+--- a/tt_metal/fabric/routing_table_generator.cpp
++++ b/tt_metal/fabric/routing_table_generator.cpp
+@@ -64,6 +64,18 @@ void RoutingTableGenerator::generate_intramesh_routing_table(const IntraMeshConn
+         bool a_valid = true, b_valid = true;
+         while (a_valid or b_valid) {
+             if (intra_mesh_connectivity[mesh_id_val][curr_a].contains(dst_chip_id) and
++                intra_mesh_connectivity[mesh_id_val][curr_a].at(dst_chip_id).port_direction == a and
++                intra_mesh_connectivity[mesh_id_val][curr_b].contains(dst_chip_id) and
++                intra_mesh_connectivity[mesh_id_val][curr_b].at(dst_chip_id).port_direction == b) {
++                // TODO(heehoon): hard-coded routing tie-break for galaxy
++                // even rows send to south, odd rows send to north
++                if (src_chip_id / 4 % 2 == 0) {
++                    return b;
++                } else {
++                    return a;
++                }
++            } else if (
++                intra_mesh_connectivity[mesh_id_val][curr_a].contains(dst_chip_id) and
+                 intra_mesh_connectivity[mesh_id_val][curr_a].at(dst_chip_id).port_direction == a) {
+                 return a;
+             }
+diff --git a/tt_metal/hostdevcommon/api/hostdevcommon/fabric_common.h b/tt_metal/hostdevcommon/api/hostdevcommon/fabric_common.h
+index 2b52040b4c4f42466d3802bdec40a447c1837498..b7c2d7db78b82a89fe294b8aa7f1ce05e8f19c06 100644
+--- a/tt_metal/hostdevcommon/api/hostdevcommon/fabric_common.h
++++ b/tt_metal/hostdevcommon/api/hostdevcommon/fabric_common.h
+@@ -600,8 +600,8 @@ struct routing_l1_info_t {
+         intra_mesh_routing_path_t<2, true> routing_path_table_2d;   // 1024 bytes
+     };
+ 
+-    std::uint8_t exit_node_table[MAX_NUM_MESHES] = {};               // 1024 bytes
+-    uint8_t padding[12] = {};                                        // pad to 16-byte alignment
++    std::uint8_t exit_node_table[MAX_NUM_MESHES] = {};  // 1024 bytes
++    uint8_t padding[12] = {};                           // pad to 16-byte alignment
+ };
+ static_assert(offsetof(routing_l1_info_t, routing_path_table_1d) == 516);
+ static_assert(offsetof(routing_l1_info_t, state_manager) % 16 == 0);
+diff --git a/ttnn/cpp/ttnn-nanobind/fabric.cpp b/ttnn/cpp/ttnn-nanobind/fabric.cpp
+index e5feda07b5cff8904d2aa0f5b0113cb70e0571cb..b6fac1b396d65d481c30da25ab2cd817ad95a1be 100644
+--- a/ttnn/cpp/ttnn-nanobind/fabric.cpp
++++ b/ttnn/cpp/ttnn-nanobind/fabric.cpp
+@@ -112,6 +112,11 @@ void bind_fabric_api(nb::module_& mod) {
+         .value("INIT_FABRIC", tt::tt_fabric::FabricManagerMode::INIT_FABRIC)
+         .value("TERMINATE_FABRIC", tt::tt_fabric::FabricManagerMode::TERMINATE_FABRIC);
+ 
++    nb::enum_<tt::tt_fabric::StaticIntermeshEndpointRole>(mod, "StaticIntermeshEndpointRole")
++        .value("DISABLED", tt::tt_fabric::StaticIntermeshEndpointRole::DISABLED)
++        .value("GALAXY_GATEWAY", tt::tt_fabric::StaticIntermeshEndpointRole::GALAXY_GATEWAY)
++        .value("T3K_ENDPOINT", tt::tt_fabric::StaticIntermeshEndpointRole::T3K_ENDPOINT);
++
+     nb::class_<tt::tt_fabric::FabricRouterConfig>(mod, "FabricRouterConfig", R"(
+         Configuration for router-level parameters.
+         Extensible for future router tuning (buffer counts, VC settings, etc.)
+@@ -121,7 +126,30 @@ void bind_fabric_api(nb::module_& mod) {
+             "max_packet_payload_size_bytes",
+             &tt::tt_fabric::FabricRouterConfig::max_packet_payload_size_bytes,
+             "Optional override for maximum packet payload size (bytes). If not set, uses architecture and routing mode "
+-            "defaults.");
++            "defaults.")
++        .def_rw(
++            "intermesh_vc0_only",
++            &tt::tt_fabric::FabricRouterConfig::intermesh_vc0_only,
++            "Use VC0 only for direct inter-mesh traffic and omit VC1 router resources.")
++        .def_rw("static_intermesh_endpoint_role", &tt::tt_fabric::FabricRouterConfig::static_intermesh_endpoint_role)
++        .def_rw(
++            "static_intermesh_endpoint_physical_chip",
++            &tt::tt_fabric::FabricRouterConfig::static_intermesh_endpoint_physical_chip)
++        .def_rw(
++            "static_intermesh_endpoint_link_index",
++            &tt::tt_fabric::FabricRouterConfig::static_intermesh_endpoint_link_index)
++        .def_rw(
++            "static_intermesh_endpoint_link_count",
++            &tt::tt_fabric::FabricRouterConfig::static_intermesh_endpoint_link_count)
++        .def_rw(
++            "static_intermesh_peer_handshake_address",
++            &tt::tt_fabric::FabricRouterConfig::static_intermesh_peer_handshake_address)
++        .def_rw(
++            "static_intermesh_peer_receiver_base_address",
++            &tt::tt_fabric::FabricRouterConfig::static_intermesh_peer_receiver_base_address)
++        .def_rw(
++            "static_intermesh_peer_receiver_num_slots",
++            &tt::tt_fabric::FabricRouterConfig::static_intermesh_peer_receiver_num_slots);
+ 
+     mod.def(
+         "set_fabric_config",

@@ -1,0 +1,7 @@
+chunk_size: 128
+local_cpu: false
+max_local_cpu_size: 128.0
+remote_serde: "naive"
+save_unfull_chunk: true
+save_decode_cache: false
+lookup_timeout_ms: 60000

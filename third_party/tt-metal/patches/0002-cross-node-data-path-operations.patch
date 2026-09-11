@@ -1,0 +1,2782 @@
+diff --git a/ttnn/cpp/ttnn/operations/experimental/CMakeLists.txt b/ttnn/cpp/ttnn/operations/experimental/CMakeLists.txt
+index 1e96f8eb922ff335fe38eb283f460c9747075b87..8ba446e8babf3e341f5605643e8ab350a6bd963e 100644
+--- a/ttnn/cpp/ttnn/operations/experimental/CMakeLists.txt
++++ b/ttnn/cpp/ttnn/operations/experimental/CMakeLists.txt
+@@ -17,6 +17,7 @@
+ 
+ # metalium-developers-convolutions
+ add_subdirectory(adaptive_pool)
++add_subdirectory(moreh_paged_fill_cache_varlen) # moreh-t3knic: paged KV fill used by the LMCache restore path
+ add_subdirectory(conv3d)
+ add_subdirectory(cnn)
+ 
+@@ -100,6 +101,7 @@ target_link_libraries(
+         TTNN::Ops::Experimental::DeepseekMoEPostCombineTilize
+         TTNN::Ops::Experimental::Dropout
+         TTNN::Ops::Experimental::MultiScaleDeformableAttn
++        TTNN::Ops::Experimental::MorehPagedFillCacheVarlen
+         TTNN::Ops::Experimental::PlusOne
+         TTNN::Ops::Experimental::Reshape
+         TTNN::Ops::Experimental::SSM
+@@ -147,6 +149,7 @@ target_sources(
+         $<TARGET_OBJECTS:TTNN::Ops::Experimental::DeepseekMoEPostCombineTilize>
+         $<TARGET_OBJECTS:TTNN::Ops::Experimental::Dropout>
+         $<TARGET_OBJECTS:TTNN::Ops::Experimental::MultiScaleDeformableAttn>
++        $<TARGET_OBJECTS:TTNN::Ops::Experimental::MorehPagedFillCacheVarlen>
+         $<TARGET_OBJECTS:TTNN::Ops::Experimental::PlusOne>
+         $<TARGET_OBJECTS:TTNN::Ops::Experimental::Reshape>
+         $<TARGET_OBJECTS:TTNN::Ops::Experimental::SSM>
+diff --git a/ttnn/cpp/ttnn/operations/experimental/experimental_nanobind.cpp b/ttnn/cpp/ttnn/operations/experimental/experimental_nanobind.cpp
+index 39a14ec1fd299978600153f8ecd7e52d30b98e63..f8861e780faf8549c7c63deda080b8e0fc54c460 100644
+--- a/ttnn/cpp/ttnn/operations/experimental/experimental_nanobind.cpp
++++ b/ttnn/cpp/ttnn/operations/experimental/experimental_nanobind.cpp
+@@ -54,6 +54,8 @@
+ #include "ttnn/operations/experimental/deepseek_prefill/inbound_socket_service_sync/inbound_socket_service_sync_nanobind.hpp"
+ #include "ttnn/operations/experimental/bcast_to/bcast_to_nanobind.hpp"
+ #include "ttnn/operations/experimental/multi_scale_deformable_attn/multi_scale_deformable_attn_nanobind.hpp"
++#include "ttnn/operations/experimental/moreh_raw_byte_copy/moreh_raw_byte_copy_nanobind.hpp"
++#include "ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen_nanobind.hpp"
+ #include "ttnn/operations/experimental/reshape/view_nanobind.hpp"
+ #include "ttnn/operations/experimental/transformer/all_reduce_create_qkv_heads/all_reduce_create_qkv_heads_nanobind.hpp"
+ #include "ttnn/operations/experimental/unary_backward/gelu_backward/gelu_backward_nanobind.hpp"
+@@ -180,6 +182,8 @@ void py_module(nb::module_& mod) {
+ 
+     broadcast_to::detail::bind_broadcast_to(mod);
+     multi_scale_deformable_attn::detail::bind_multi_scale_deformable_attn(mod);
++    moreh_raw_byte_copy::detail::bind_moreh_raw_byte_copy(mod);
++    moreh_paged_fill_cache_varlen::detail::bind_moreh_paged_fill_cache_varlen(mod);
+ 
+     minimal_matmul::detail::bind_minimal_matmul(mod);
+     minimal_matmul::detail::bind_minimal_matmul_split(mod);
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/CMakeLists.txt b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..83335cd88a3b8de4baacc8c7c1525dee1782f3ad
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/CMakeLists.txt
+@@ -0,0 +1,49 @@
++add_library(ttnn_op_experimental_moreh_paged_fill_cache_varlen ${LIB_TYPE})
++add_library(TTNN::Ops::Experimental::MorehPagedFillCacheVarlen ALIAS ttnn_op_experimental_moreh_paged_fill_cache_varlen)
++
++target_precompile_headers(ttnn_op_experimental_moreh_paged_fill_cache_varlen REUSE_FROM TT::CommonPCH)
++TT_ENABLE_UNITY_BUILD(ttnn_op_experimental_moreh_paged_fill_cache_varlen)
++
++set_target_properties(
++    ttnn_op_experimental_moreh_paged_fill_cache_varlen
++    PROPERTIES
++        INTERFACE_HEADER_SETS_TO_VERIFY
++            api
++)
++
++file(GLOB_RECURSE kernels device/kernels/**/*.cpp)
++
++target_sources(
++    ttnn_op_experimental_moreh_paged_fill_cache_varlen
++    PUBLIC
++        FILE_SET api
++        TYPE HEADERS
++        BASE_DIRS ${FixmeOpAPIDir}
++        FILES moreh_paged_fill_cache_varlen.hpp
++        FILE_SET kernels
++        TYPE HEADERS
++        BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
++        FILES ${kernels}
++    PRIVATE
++        device/moreh_paged_fill_cache_varlen_device_operation.cpp
++        device/moreh_paged_fill_cache_varlen_program_factory.cpp
++        moreh_paged_fill_cache_varlen.cpp
++)
++
++target_include_directories(ttnn_op_experimental_moreh_paged_fill_cache_varlen PRIVATE ${FixmeOpIncDirs})
++target_link_libraries(ttnn_op_experimental_moreh_paged_fill_cache_varlen PUBLIC TTNN::Core PRIVATE TT::Metalium)
++
++install(
++    TARGETS
++        ttnn_op_experimental_moreh_paged_fill_cache_varlen
++    FILE_SET
++    api
++        COMPONENT ttnn-dev
++    FILE_SET
++    kernels
++        DESTINATION
++            ${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen
++        COMPONENT ttnn-runtime
++)
++
++install(TARGETS ttnn_op_experimental_moreh_paged_fill_cache_varlen LIBRARY COMPONENT tar)
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/kernels/dataflow/reader_fill_cache_varlen.cpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/kernels/dataflow/reader_fill_cache_varlen.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3e5b9108f26014cc412c64c0644794272dad265
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/kernels/dataflow/reader_fill_cache_varlen.cpp
+@@ -0,0 +1,105 @@
++
++// SPDX-License-Identifier: Apache-2.0
++//
++// Reader kernel for moreh_paged_fill_cache_varlen
++//
++// Reads packed K and V tiles from DRAM, plus cu_seqlens for the writer to use.
++// Each core processes a contiguous range of tile-rows from the packed K/V tensors.
++
++#include <stdint.h>
++
++#include "api/dataflow/dataflow_api.h"
++
++void kernel_main() {
++    // CB IDs
++    constexpr uint32_t cb_k = get_named_compile_time_arg_val("cb_k");
++    constexpr uint32_t cb_v = get_named_compile_time_arg_val("cb_v");
++    constexpr uint32_t cb_cu_seqlens = get_named_compile_time_arg_val("cb_cu_seqlens");
++
++    // constexprs
++    constexpr uint32_t Wt = get_named_compile_time_arg_val("Wt");
++    constexpr uint32_t total_tokens_t = get_named_compile_time_arg_val("total_tokens_t");
++    constexpr uint32_t max_batch_size = get_named_compile_time_arg_val("max_batch_size");
++    constexpr uint32_t cu_seqlens_stick_size = get_named_compile_time_arg_val("cu_seqlens_stick_size");
++
++    constexpr auto k_args = TensorAccessorArgs<0>();
++    constexpr auto v_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
++    constexpr auto cu_seqlens_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
++
++    // Runtime args
++    uint32_t argidx = 0;
++    const uint32_t k_addr = get_arg_val<uint32_t>(argidx++);
++    const uint32_t v_addr = get_arg_val<uint32_t>(argidx++);
++    const uint32_t cu_seqlens_addr = get_arg_val<uint32_t>(argidx++);
++    const uint32_t start_tile_id = get_arg_val<uint32_t>(argidx++);
++    const uint32_t num_rows = get_arg_val<uint32_t>(argidx++);
++
++    const auto k_reader = TensorAccessor(k_args, k_addr, get_tile_size(cb_k));
++    const auto v_reader = TensorAccessor(v_args, v_addr, get_tile_size(cb_k));
++    const auto cu_seqlens_reader = TensorAccessor(cu_seqlens_args, cu_seqlens_addr, cu_seqlens_stick_size);
++
++    constexpr uint32_t TILE_SIZE = 32;
++    const uint32_t tile_bytes = get_tile_size(cb_k);
++    const uint32_t start_row_num = start_tile_id / Wt;
++
++    // Read cu_seqlens once into CB (shared with writer)
++    cb_reserve_back(cb_cu_seqlens, 1);
++    uint32_t cu_seqlens_l1_addr = get_write_ptr(cb_cu_seqlens);
++    uint64_t cu_seqlens_noc_addr = cu_seqlens_reader.get_noc_addr(0);
++    noc_async_read(cu_seqlens_noc_addr, cu_seqlens_l1_addr, cu_seqlens_stick_size);
++    noc_async_read_barrier();
++    cb_push_back(cb_cu_seqlens, 1);
++
++    // Find actual_total_tokens by binary searching for the -1 boundary in cu_seqlens
++    // cu_seqlens layout: [0, cs1, ..., cs_{valid_max_batch_size}, -1, -1, ...]
++    volatile tt_l1_ptr uint32_t* cu_seqlens_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cu_seqlens_l1_addr);
++    uint32_t bs_lo = 0, bs_hi = max_batch_size;
++    while (bs_lo < bs_hi) {
++        uint32_t mid = (bs_lo + bs_hi + 1) >> 1;
++        if (cu_seqlens_ptr[mid] != (uint32_t)-1) {
++            bs_lo = mid;
++        } else {
++            bs_hi = mid - 1;
++        }
++    }
++    uint32_t actual_total_tokens = cu_seqlens_ptr[bs_lo];
++
++    // Read K and V tiles together per row
++    uint32_t tile_id = start_tile_id;
++    for (uint32_t row = 0; row < num_rows; ++row) {
++        uint32_t row_id = start_row_num + row;
++        uint32_t global_token_tile = row_id % total_tokens_t;
++        uint32_t global_token_pos = global_token_tile * TILE_SIZE;
++
++        if (global_token_pos >= actual_total_tokens) {
++            tile_id += Wt;
++            continue;  // skip DRAM read and CB push — writer will also skip
++        }
++
++        // Read K tiles
++        cb_reserve_back(cb_k, Wt);
++        uint32_t l1_write_addr = get_write_ptr(cb_k);
++        uint32_t cur_tile_id = tile_id;
++        for (uint32_t w = 0; w < Wt; ++w) {
++            noc_async_read_tile(cur_tile_id, k_reader, l1_write_addr);
++            l1_write_addr += tile_bytes;
++            cur_tile_id++;
++        }
++        noc_async_read_barrier();
++        cb_push_back(cb_k, Wt);
++
++        // Read V tiles (same tile offset, different tensor)
++        cb_reserve_back(cb_v, Wt);
++        l1_write_addr = get_write_ptr(cb_v);
++        cur_tile_id = tile_id;
++        for (uint32_t w = 0; w < Wt; ++w) {
++            noc_async_read_tile(cur_tile_id, v_reader, l1_write_addr);
++            l1_write_addr += tile_bytes;
++            cur_tile_id++;
++        }
++        noc_async_read_barrier();
++        cb_push_back(cb_v, Wt);
++
++        tile_id += Wt;
++    }
++}
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/kernels/dataflow/writer_fill_cache_varlen.cpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/kernels/dataflow/writer_fill_cache_varlen.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffc08b82612a76b39c2609344376fa4f68befd45
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/kernels/dataflow/writer_fill_cache_varlen.cpp
+@@ -0,0 +1,199 @@
++
++// SPDX-License-Identifier: Apache-2.0
++//
++// Writer kernel for moreh_paged_fill_cache_varlen
++//
++// For each tile-row assigned to this core:
++// 1. Determine which request it belongs to via binary search on cu_seqlens
++// 2. Compute the local position within that request
++// 3. Look up the page table for that request to get the physical block
++// 4. Write K and V tiles to the correct cache location
++
++#include <stdint.h>
++
++#include "api/dataflow/dataflow_api.h"
++
++// Binary search: find the request index for a given global token position.
++// cu_seqlens is [0, len0, len0+len1, ...], size = max_batch_size + 1
++// Returns req_idx such that cu_seqlens[req_idx] <= token_pos < cu_seqlens[req_idx + 1]
++inline uint32_t find_request_idx(
++    const volatile tt_l1_ptr uint32_t* cu_seqlens_ptr, uint32_t max_batch_size, uint32_t token_pos) {
++    uint32_t lo = 0;
++    uint32_t hi = max_batch_size;  // search in [0, max_batch_size)
++    while (lo < hi) {
++        uint32_t mid = (lo + hi + 1) >> 1;
++        if (cu_seqlens_ptr[mid] <= token_pos) {
++            lo = mid;
++        } else {
++            hi = mid - 1;
++        }
++    }
++    return lo;
++}
++
++// 0 matches vLLM's null_block id (block_id=0 is reserved as null).
++constexpr uint32_t SKIP_PAGE_TABLE_ENTRY = 0;
++
++void kernel_main() {
++    // CB IDs
++    constexpr uint32_t cb_k = get_named_compile_time_arg_val("cb_k");
++    constexpr uint32_t cb_v = get_named_compile_time_arg_val("cb_v");
++    constexpr uint32_t cb_page_table = get_named_compile_time_arg_val("cb_page_table");
++    constexpr uint32_t cb_cu_seqlens = get_named_compile_time_arg_val("cb_cu_seqlens");
++    constexpr uint32_t cb_start_positions = get_named_compile_time_arg_val("cb_start_positions");
++
++    // constexprs
++    constexpr uint32_t num_kv_heads = get_named_compile_time_arg_val("num_kv_heads");
++    constexpr uint32_t total_tokens_t = get_named_compile_time_arg_val("total_tokens_t");
++    constexpr uint32_t block_size_t = get_named_compile_time_arg_val("block_size_t");
++    constexpr uint32_t Wt = get_named_compile_time_arg_val("Wt");
++    constexpr uint32_t page_table_stick_size = get_named_compile_time_arg_val("page_table_stick_size");
++    constexpr uint32_t max_batch_size = get_named_compile_time_arg_val("max_batch_size");
++    constexpr uint32_t start_positions_stick_size = get_named_compile_time_arg_val("start_positions_stick_size");
++
++    constexpr uint32_t block_stride = num_kv_heads * block_size_t * Wt;
++
++    constexpr auto cache_k_args = TensorAccessorArgs<0>();
++    constexpr auto cache_v_args = TensorAccessorArgs<cache_k_args.next_compile_time_args_offset()>();
++    constexpr auto page_table_args = TensorAccessorArgs<cache_v_args.next_compile_time_args_offset()>();
++    constexpr auto start_positions_args = TensorAccessorArgs<page_table_args.next_compile_time_args_offset()>();
++
++    // Runtime args
++    uint32_t argidx = 0;
++    const uint32_t cache_k_addr = get_arg_val<uint32_t>(argidx++);
++    const uint32_t cache_v_addr = get_arg_val<uint32_t>(argidx++);
++    const uint32_t page_table_addr = get_arg_val<uint32_t>(argidx++);
++    const uint32_t start_positions_addr = get_arg_val<uint32_t>(argidx++);
++    const uint32_t start_row_num = get_arg_val<uint32_t>(argidx++);
++    const uint32_t num_rows = get_arg_val<uint32_t>(argidx++);
++
++    const auto cache_k_writer = TensorAccessor(cache_k_args, cache_k_addr, get_tile_size(cb_k));
++    const auto cache_v_writer = TensorAccessor(cache_v_args, cache_v_addr, get_tile_size(cb_k));
++    const auto page_table_reader = TensorAccessor(page_table_args, page_table_addr, page_table_stick_size);
++    const auto start_positions_reader =
++        TensorAccessor(start_positions_args, start_positions_addr, start_positions_stick_size);
++
++    constexpr uint32_t TILE_SIZE = 32;
++    const uint32_t tile_bytes = get_tile_size(cb_k);
++
++    // Wait for cu_seqlens from reader
++    cb_wait_front(cb_cu_seqlens, 1);
++    volatile tt_l1_ptr uint32_t* cu_seqlens_ptr =
++        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_cu_seqlens));
++
++    // Read start_positions into CB
++    cb_reserve_back(cb_start_positions, 1);
++    uint32_t start_positions_l1_addr = get_write_ptr(cb_start_positions);
++    uint64_t start_positions_noc_addr = start_positions_reader.get_noc_addr(0);
++    noc_async_read(start_positions_noc_addr, start_positions_l1_addr, start_positions_stick_size);
++    noc_async_read_barrier();
++    cb_push_back(cb_start_positions, 1);
++    cb_wait_front(cb_start_positions, 1);
++    volatile tt_l1_ptr uint32_t* start_positions_ptr =
++        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_start_positions));
++
++    // Find actual_total_tokens by binary searching for the -1 boundary in cu_seqlens
++    // cu_seqlens layout: [0, cs1, ..., cs_{valid_max_batch_size}, -1, -1, ...]
++    uint32_t bs_lo = 0, bs_hi = max_batch_size;
++    while (bs_lo < bs_hi) {
++        uint32_t mid = (bs_lo + bs_hi + 1) >> 1;
++        if (cu_seqlens_ptr[mid] != (uint32_t)-1) {
++            bs_lo = mid;
++        } else {
++            bs_hi = mid - 1;
++        }
++    }
++    uint32_t actual_total_tokens = cu_seqlens_ptr[bs_lo];
++
++    // We'll cache the current request's page table to avoid reloading it every row
++    uint32_t cached_req_idx = (uint32_t)-1;
++    volatile tt_l1_ptr uint32_t* page_table_ptr = nullptr;
++    bool page_table_cached = false;
++
++    // Process K and V tiles together per row
++    for (uint32_t row_id = start_row_num; row_id < start_row_num + num_rows; ++row_id) {
++        uint32_t cur_head = row_id / total_tokens_t;
++        uint32_t global_token_tile = row_id % total_tokens_t;
++        uint32_t global_token_pos = global_token_tile * TILE_SIZE;
++
++        // Skip padding rows beyond valid token range (reader also skips these)
++        if (global_token_pos >= actual_total_tokens) {
++            continue;
++        }
++
++        // Binary search to find which request this token belongs to
++        uint32_t req_idx = find_request_idx(cu_seqlens_ptr, max_batch_size, global_token_pos);
++
++        // Load page table for this request if not cached
++        if (req_idx != cached_req_idx) {
++            if (page_table_cached) {
++                cb_pop_front(cb_page_table, 1);
++            }
++            cb_reserve_back(cb_page_table, 1);
++            uint32_t page_table_l1_addr = get_write_ptr(cb_page_table);
++            uint64_t page_table_noc_addr = page_table_reader.get_noc_addr(req_idx);
++            noc_async_read(page_table_noc_addr, page_table_l1_addr, page_table_stick_size);
++            noc_async_read_barrier();
++            cb_push_back(cb_page_table, 1);
++            cb_wait_front(cb_page_table, 1);
++            page_table_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_page_table));
++            cached_req_idx = req_idx;
++            page_table_cached = true;
++        }
++
++        // Local position within request (in tokens), offset by start_positions for chunked prefill
++        uint32_t req_start_token = cu_seqlens_ptr[req_idx];
++        uint32_t local_token_pos = global_token_pos - req_start_token;
++        uint32_t cache_token_pos = local_token_pos + start_positions_ptr[req_idx];
++        uint32_t cache_seq_tile = cache_token_pos / TILE_SIZE;
++
++        // Convert virtual seq tile to physical tile id
++        uint32_t virtual_block = cache_seq_tile / block_size_t;
++        uint32_t physical_block = page_table_ptr[virtual_block];
++        uint32_t physical_tile_id = SKIP_PAGE_TABLE_ENTRY;
++        // Skip null (0) AND any negative entry. vLLM marks unused/padded slots
++        // with -1 (0xFFFFFFFF); the t3knic multi-device retrieve also uses -1 to
++        // skip the non-target DP group. Without the negative check, -1 becomes a
++        // huge physical_tile_id -> interleaved OOB write into unrelated DRAM.
++        if (physical_block != SKIP_PAGE_TABLE_ENTRY && (int32_t)physical_block >= 0) {
++            uint32_t head_offset = cur_head * block_size_t * Wt;
++            uint32_t block_offset = (cache_seq_tile % block_size_t) * Wt;
++            physical_tile_id = physical_block * block_stride + head_offset + block_offset;
++        }
++
++        // Write K tiles
++        cb_wait_front(cb_k, Wt);
++        if (physical_tile_id != SKIP_PAGE_TABLE_ENTRY) {
++            uint32_t l1_read_addr = get_read_ptr(cb_k);
++            uint32_t k_phys_id = physical_tile_id;
++            for (uint32_t w = 0; w < Wt; ++w) {
++                noc_async_write_tile(k_phys_id, cache_k_writer, l1_read_addr);
++                l1_read_addr += tile_bytes;
++                k_phys_id += 1;
++            }
++            noc_async_write_barrier();
++        }
++        cb_pop_front(cb_k, Wt);
++
++        // Write V tiles (same physical location, different cache)
++        cb_wait_front(cb_v, Wt);
++        if (physical_tile_id != SKIP_PAGE_TABLE_ENTRY) {
++            uint32_t l1_read_addr = get_read_ptr(cb_v);
++            uint32_t v_phys_id = physical_tile_id;
++            for (uint32_t w = 0; w < Wt; ++w) {
++                noc_async_write_tile(v_phys_id, cache_v_writer, l1_read_addr);
++                l1_read_addr += tile_bytes;
++                v_phys_id += 1;
++            }
++            noc_async_write_barrier();
++        }
++        cb_pop_front(cb_v, Wt);
++    }
++
++    // Done with metadata buffers
++    if (page_table_cached) {
++        cb_pop_front(cb_page_table, 1);
++    }
++    cb_pop_front(cb_cu_seqlens, 1);
++    cb_pop_front(cb_start_positions, 1);
++}
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_device_operation.cpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_device_operation.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a5771688691d19fd5aa37be48f9f6fdca0b67f7b
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_device_operation.cpp
+@@ -0,0 +1,181 @@
++
++#include "moreh_paged_fill_cache_varlen_device_operation.hpp"
++
++#include "ttnn/device_operation.hpp"
++#include "ttnn/tensor/tensor.hpp"
++
++namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen {
++
++MorehPagedFillCacheVarlenDeviceOperation::program_factory_t
++MorehPagedFillCacheVarlenDeviceOperation::select_program_factory(const operation_attributes_t&, const tensor_args_t&) {
++    return program::MorehPagedFillCacheVarlenProgramFactory{};
++}
++
++void MorehPagedFillCacheVarlenDeviceOperation::validate_on_program_cache_miss(
++    [[maybe_unused]] const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
++    const auto& k_fill = tensor_args.k_fill_value;
++    const auto& v_fill = tensor_args.v_fill_value;
++    const auto& cu_seqlens = tensor_args.cu_seqlens;
++    const auto& page_table = tensor_args.page_table;
++    const auto& start_positions = tensor_args.start_positions;
++    const auto& cache_k = tensor_args.cache_k;
++    const auto& cache_v = tensor_args.cache_v;
++
++    // Device and storage validation
++    TT_FATAL(
++        k_fill.storage_type() == StorageType::DEVICE && v_fill.storage_type() == StorageType::DEVICE,
++        "k_fill_value and v_fill_value must be on device!");
++    TT_FATAL(
++        cache_k.storage_type() == StorageType::DEVICE && cache_v.storage_type() == StorageType::DEVICE,
++        "cache_k and cache_v must be on device!");
++    TT_FATAL(cu_seqlens.storage_type() == StorageType::DEVICE, "cu_seqlens must be on device!");
++    TT_FATAL(page_table.storage_type() == StorageType::DEVICE, "page_table must be on device!");
++
++    TT_FATAL(
++        k_fill.device() == cache_k.device() && v_fill.device() == cache_v.device() &&
++            k_fill.device() == v_fill.device(),
++        "All tensors must be on the same device!");
++
++    TT_FATAL(start_positions.storage_type() == StorageType::DEVICE, "start_positions must be on device!");
++
++    TT_FATAL(
++        k_fill.buffer() != nullptr && v_fill.buffer() != nullptr && cu_seqlens.buffer() != nullptr &&
++            page_table.buffer() != nullptr && start_positions.buffer() != nullptr && cache_k.buffer() != nullptr &&
++            cache_v.buffer() != nullptr,
++        "All tensors must be allocated in buffers on device!");
++
++    // Layout validation
++    TT_FATAL(k_fill.layout() == Layout::TILE, "k_fill_value must be tilized");
++    TT_FATAL(v_fill.layout() == Layout::TILE, "v_fill_value must be tilized");
++    TT_FATAL(cache_k.layout() == Layout::TILE, "cache_k must be tilized");
++    TT_FATAL(cache_v.layout() == Layout::TILE, "cache_v must be tilized");
++
++    // Data type validation — fill_value and cache must share the same dtype
++    TT_FATAL(
++        k_fill.dtype() == cache_k.dtype(),
++        "k_fill_value dtype ({}) must match cache_k dtype ({})",
++        k_fill.dtype(),
++        cache_k.dtype());
++    TT_FATAL(
++        v_fill.dtype() == cache_v.dtype(),
++        "v_fill_value dtype ({}) must match cache_v dtype ({})",
++        v_fill.dtype(),
++        cache_v.dtype());
++    TT_FATAL(
++        cache_k.dtype() == DataType::FLOAT32 || cache_k.dtype() == DataType::BFLOAT16 ||
++            cache_k.dtype() == DataType::BFLOAT8_B || cache_k.dtype() == DataType::BFLOAT4_B,
++        "cache_k dtype must be FLOAT32, BFLOAT16, BFLOAT8_B, or BFLOAT4_B, got {}",
++        cache_k.dtype());
++
++    // Memory layout validation
++    TT_FATAL(
++        cache_k.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
++        "Only interleaved cache is supported");
++    TT_FATAL(
++        cache_v.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
++        "Only interleaved cache is supported");
++
++    // Shape validation
++    // k_fill_value: [1, num_kv_heads, total_tokens, head_dim]
++    // v_fill_value: [1, num_kv_heads, total_tokens, head_dim]
++    // cache_k: [max_num_blocks, num_kv_heads, block_size, head_dim]
++    // cache_v: [max_num_blocks, num_kv_heads, block_size, head_dim]
++    // cu_seqlens: [batch_size + 1] (ROW_MAJOR, INT32)
++    // page_table: [batch_size, max_num_blocks_per_seq] (ROW_MAJOR, INT32)
++    TT_FATAL(k_fill.logical_shape()[0] == 1, "k_fill_value first dim must be 1, got {}", k_fill.logical_shape()[0]);
++    TT_FATAL(v_fill.logical_shape()[0] == 1, "v_fill_value first dim must be 1, got {}", v_fill.logical_shape()[0]);
++    TT_FATAL(k_fill.logical_shape()[-1] == cache_k.logical_shape()[-1], "head_dim of k_fill_value must match cache_k");
++    TT_FATAL(v_fill.logical_shape()[-1] == cache_v.logical_shape()[-1], "head_dim of v_fill_value must match cache_v");
++    TT_FATAL(
++        k_fill.logical_shape() == v_fill.logical_shape(), "k_fill_value and v_fill_value must have the same shape");
++    TT_FATAL(cache_k.logical_shape() == cache_v.logical_shape(), "cache_k and cache_v must have the same shape");
++
++    // cu_seqlens validation
++    TT_FATAL(cu_seqlens.layout() == Layout::ROW_MAJOR, "cu_seqlens must be ROW_MAJOR layout");
++    TT_FATAL(cu_seqlens.dtype() == DataType::INT32, "cu_seqlens must be INT32");
++
++    // page_table validation — INT32, DRAM (interleaved), ROW_MAJOR
++    TT_FATAL(page_table.layout() == Layout::ROW_MAJOR, "page_table must be ROW_MAJOR layout");
++    TT_FATAL(page_table.dtype() == DataType::INT32, "page_table must be INT32");
++    TT_FATAL(
++        page_table.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
++        "page_table must be interleaved (DRAM)");
++
++    TT_FATAL(
++        page_table.logical_shape()[1] <= cache_k.logical_shape()[0],
++        "max_num_blocks_per_seq ({}) must be <= max_num_blocks ({})",
++        page_table.logical_shape()[1],
++        cache_k.logical_shape()[0]);
++
++    // start_positions validation — INT32, ROW_MAJOR, [batch_size]
++    TT_FATAL(start_positions.layout() == Layout::ROW_MAJOR, "start_positions must be ROW_MAJOR layout");
++    TT_FATAL(start_positions.dtype() == DataType::INT32, "start_positions must be INT32");
++    TT_FATAL(
++        start_positions.logical_shape()[0] == page_table.logical_shape()[0],
++        "start_positions size ({}) must match batch_size ({})",
++        start_positions.logical_shape()[0],
++        page_table.logical_shape()[0]);
++}
++
++void MorehPagedFillCacheVarlenDeviceOperation::validate_on_program_cache_hit(
++    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
++    validate_on_program_cache_miss(operation_attributes, tensor_args);
++}
++
++spec_return_value_t MorehPagedFillCacheVarlenDeviceOperation::compute_output_specs(
++    const operation_attributes_t&, const tensor_args_t& tensor_args) {
++    return {tensor_args.cache_k.tensor_spec(), tensor_args.cache_v.tensor_spec()};
++}
++
++tensor_return_value_t MorehPagedFillCacheVarlenDeviceOperation::create_output_tensors(
++    const operation_attributes_t&, const tensor_args_t& tensor_args) {
++    return {tensor_args.cache_k, tensor_args.cache_v};
++}
++
++std::tuple<operation_attributes_t, tensor_args_t> MorehPagedFillCacheVarlenDeviceOperation::invoke(
++    const Tensor& k_fill_value,
++    const Tensor& v_fill_value,
++    const Tensor& cu_seqlens,
++    const Tensor& page_table,
++    const Tensor& start_positions,
++    const Tensor& cache_k,
++    const Tensor& cache_v) {
++    return {
++        operation_attributes_t{},
++        tensor_args_t{
++            .k_fill_value = k_fill_value,
++            .v_fill_value = v_fill_value,
++            .cu_seqlens = cu_seqlens,
++            .page_table = page_table,
++            .start_positions = start_positions,
++            .cache_k = cache_k,
++            .cache_v = cache_v}};
++}
++
++}  // namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen
++
++namespace ttnn::prim {
++
++void moreh_paged_fill_cache_varlen(
++    const Tensor& k_fill_value,
++    const Tensor& v_fill_value,
++    const Tensor& cu_seqlens,
++    const Tensor& page_table,
++    const Tensor& start_positions,
++    const Tensor& cache_k,
++    const Tensor& cache_v) {
++    using OperationType =
++        ttnn::operations::experimental::moreh_paged_fill_cache_varlen::MorehPagedFillCacheVarlenDeviceOperation;
++    ttnn::device_operation::launch<OperationType>(
++        OperationType::operation_attributes_t{},
++        OperationType::tensor_args_t{
++            .k_fill_value = k_fill_value,
++            .v_fill_value = v_fill_value,
++            .cu_seqlens = cu_seqlens,
++            .page_table = page_table,
++            .start_positions = start_positions,
++            .cache_k = cache_k,
++            .cache_v = cache_v});
++}
++
++}  // namespace ttnn::prim
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_device_operation.hpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_device_operation.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1df65aec0ef610b72220ac5c205a73e52b3a6e20
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_device_operation.hpp
+@@ -0,0 +1,51 @@
++
++#pragma once
++
++#include <variant>
++
++#include "moreh_paged_fill_cache_varlen_device_operation_types.hpp"
++#include "moreh_paged_fill_cache_varlen_program_factory.hpp"
++
++namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen {
++
++struct MorehPagedFillCacheVarlenDeviceOperation {
++    using operation_attributes_t = moreh_paged_fill_cache_varlen::operation_attributes_t;
++    using tensor_args_t = moreh_paged_fill_cache_varlen::tensor_args_t;
++    using tensor_return_value_t = moreh_paged_fill_cache_varlen::tensor_return_value_t;
++    using spec_return_value_t = moreh_paged_fill_cache_varlen::spec_return_value_t;
++
++    using program_factory_t = std::variant<program::MorehPagedFillCacheVarlenProgramFactory>;
++
++    static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&);
++
++    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
++    static void validate_on_program_cache_hit(const operation_attributes_t&, const tensor_args_t&);
++
++    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
++
++    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
++
++    static std::tuple<operation_attributes_t, tensor_args_t> invoke(
++        const Tensor& k_fill_value,
++        const Tensor& v_fill_value,
++        const Tensor& cu_seqlens,
++        const Tensor& page_table,
++        const Tensor& start_positions,
++        const Tensor& cache_k,
++        const Tensor& cache_v);
++};
++
++}  // namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen
++
++namespace ttnn::prim {
++
++void moreh_paged_fill_cache_varlen(
++    const Tensor& k_fill_value,
++    const Tensor& v_fill_value,
++    const Tensor& cu_seqlens,
++    const Tensor& page_table,
++    const Tensor& start_positions,
++    const Tensor& cache_k,
++    const Tensor& cache_v);
++
++}  // namespace ttnn::prim
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_device_operation_types.hpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_device_operation_types.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..68709890d096d2c1b5c26c9d07d98fcdf5c2dd8e
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_device_operation_types.hpp
+@@ -0,0 +1,24 @@
++
++#pragma once
++
++#include "ttnn/tensor/tensor.hpp"
++
++namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen {
++
++struct operation_attributes_t {};
++
++struct tensor_args_t {
++    const Tensor& k_fill_value;
++    const Tensor& v_fill_value;
++    const Tensor& cu_seqlens;
++    const Tensor& page_table;
++    const Tensor& start_positions;
++    const Tensor& cache_k;
++    const Tensor& cache_v;
++};
++
++// Returns (cache_k, cache_v) modified in-place
++using tensor_return_value_t = std::vector<Tensor>;
++using spec_return_value_t = std::vector<TensorSpec>;
++
++}  // namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_program_factory.cpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_program_factory.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b08fbdd58fb4ccd01b2e400ccb1d89269bf4f92
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_program_factory.cpp
+@@ -0,0 +1,303 @@
++
++#include "moreh_paged_fill_cache_varlen_program_factory.hpp"
++
++#include <tt-metalium/host_api.hpp>
++#include <tt-metalium/constants.hpp>
++#include <tt-metalium/work_split.hpp>
++#include <tt-metalium/tensor_accessor_args.hpp>
++
++using namespace tt::tt_metal;
++
++namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen::program {
++
++using namespace tt::constants;
++
++namespace {
++
++struct CB {
++    tt::DataFormat data_format;
++    uint32_t num_tiles;
++    uint32_t id;
++    uint32_t page_size = 0;
++
++    CircularBufferConfig to_circular_buffer_config() const {
++        const auto ps = page_size > 0 ? page_size : tt::tile_size(data_format);
++        return CircularBufferConfig(num_tiles * ps, {{static_cast<tt::CBIndex>(id), data_format}})
++            .set_page_size(static_cast<tt::CBIndex>(id), ps);
++    }
++};
++
++}  // namespace
++
++MorehPagedFillCacheVarlenProgramFactory::cached_program_t MorehPagedFillCacheVarlenProgramFactory::create(
++    const operation_attributes_t&, const tensor_args_t& tensor_args, tensor_return_value_t&) {
++    const auto& k_fill = tensor_args.k_fill_value;
++    const auto& v_fill = tensor_args.v_fill_value;
++    const auto& cu_seqlens_tensor = tensor_args.cu_seqlens;
++    const auto& page_table_tensor = tensor_args.page_table;
++    const auto& start_positions_tensor = tensor_args.start_positions;
++    const auto& cache_k = tensor_args.cache_k;
++    const auto& cache_v = tensor_args.cache_v;
++
++    Program program{};
++
++    tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(k_fill.dtype());
++
++    // k_fill_value / v_fill_value: [1, num_kv_heads, total_tokens, head_dim]
++    // cache_k / cache_v: [max_num_blocks, num_kv_heads, block_size, head_dim]
++    // cu_seqlens: [batch_size + 1] (ROW_MAJOR, INT32)
++    // page_table: [batch_size, max_num_blocks_per_seq] (ROW_MAJOR, INT32)
++    const uint32_t num_kv_heads = k_fill.padded_shape()[1];
++    const uint32_t total_tokens = k_fill.padded_shape()[2];
++    const uint32_t head_dim = k_fill.padded_shape()[3];
++
++    const uint32_t block_size = cache_k.padded_shape()[2];
++
++    const uint32_t total_tokens_t = total_tokens / TILE_HEIGHT;
++    const uint32_t Wt = head_dim / TILE_WIDTH;
++    const uint32_t block_size_t = block_size / TILE_HEIGHT;
++
++    // Work is distributed as: each "block of work" = one tile-row across all Wt columns
++    // Total work = num_kv_heads * total_tokens_t
++    uint32_t num_blocks_of_work = num_kv_heads * total_tokens_t;
++
++    uint32_t page_table_stick_size_B = page_table_tensor.buffer()->aligned_page_size();
++    TT_FATAL(
++        page_table_stick_size_B % 32 == 0,
++        "page table page size in bytes must be a multiple of 32 due to address alignment");
++    tt::DataFormat page_table_data_format = tt::tt_metal::datatype_to_dataformat_converter(page_table_tensor.dtype());
++
++    uint32_t cu_seqlens_stick_size_B = cu_seqlens_tensor.buffer()->aligned_page_size();
++    uint32_t start_positions_stick_size_B = start_positions_tensor.buffer()->aligned_page_size();
++    uint32_t max_batch_size = page_table_tensor.padded_shape()[0];
++
++    tt::tt_metal::IDevice* device = k_fill.device();
++
++    auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
++    uint32_t num_cores_x = compute_with_storage_grid_size.x;
++    uint32_t num_cores_y = compute_with_storage_grid_size.y;
++
++    bool row_major = true;
++    uint32_t num_cores, num_blocks_per_core_group_1, num_blocks_per_core_group_2;
++    CoreRangeSet all_cores, core_group_1, core_group_2;
++
++    std::tie(
++        num_cores, all_cores, core_group_1, core_group_2, num_blocks_per_core_group_1, num_blocks_per_core_group_2) =
++        tt::tt_metal::split_work_to_cores(compute_with_storage_grid_size, num_blocks_of_work, row_major);
++
++    // Circular Buffers
++    const auto cb_k_meta = CB{
++        .data_format = cb_data_format,
++        .num_tiles = Wt * 2,  // double buffered
++        .id = tt::CBIndex::c_0,
++    };
++    CreateCircularBuffer(program, all_cores, cb_k_meta.to_circular_buffer_config());
++
++    const auto cb_v_meta = CB{
++        .data_format = cb_data_format,
++        .num_tiles = Wt * 2,  // double buffered
++        .id = tt::CBIndex::c_1,
++    };
++    CreateCircularBuffer(program, all_cores, cb_v_meta.to_circular_buffer_config());
++
++    const auto cb_page_table_meta = CB{
++        .data_format = page_table_data_format,
++        .num_tiles = 1,
++        .id = tt::CBIndex::c_2,
++        .page_size = page_table_stick_size_B,
++    };
++    CreateCircularBuffer(program, all_cores, cb_page_table_meta.to_circular_buffer_config());
++
++    // cu_seqlens: (batch_size + 1) int32 values, stored as a single stick
++    const auto cb_cu_seqlens_meta = CB{
++        .data_format = tt::DataFormat::RawUInt32,
++        .num_tiles = 1,
++        .id = tt::CBIndex::c_3,
++        .page_size = cu_seqlens_stick_size_B,
++    };
++    CreateCircularBuffer(program, all_cores, cb_cu_seqlens_meta.to_circular_buffer_config());
++
++    // start_positions: [batch_size] int32 values, stored as a single stick
++    const auto cb_start_positions_meta = CB{
++        .data_format = tt::DataFormat::RawUInt32,
++        .num_tiles = 1,
++        .id = tt::CBIndex::c_4,
++        .page_size = start_positions_stick_size_B,
++    };
++    CreateCircularBuffer(program, all_cores, cb_start_positions_meta.to_circular_buffer_config());
++
++    auto* k_fill_buffer = k_fill.buffer();
++    auto* v_fill_buffer = v_fill.buffer();
++    auto* cache_k_buffer = cache_k.buffer();
++    auto* cache_v_buffer = cache_v.buffer();
++    auto* page_table_buffer = page_table_tensor.buffer();
++    auto* cu_seqlens_buffer = cu_seqlens_tensor.buffer();
++    auto* start_positions_buffer = start_positions_tensor.buffer();
++
++    // Reader compile-time args (positional: TensorAccessorArgs only)
++    std::vector<uint32_t> reader_compile_time_args;
++    TensorAccessorArgs(k_fill_buffer).append_to(reader_compile_time_args);
++    TensorAccessorArgs(v_fill_buffer).append_to(reader_compile_time_args);
++    TensorAccessorArgs(cu_seqlens_buffer).append_to(reader_compile_time_args);
++
++    std::unordered_map<std::string, uint32_t> reader_named_ctas = {
++        {"cb_k", cb_k_meta.id},
++        {"cb_v", cb_v_meta.id},
++        {"cb_cu_seqlens", cb_cu_seqlens_meta.id},
++        {"Wt", Wt},
++        {"total_tokens_t", total_tokens_t},
++        {"max_batch_size", max_batch_size},
++        {"cu_seqlens_stick_size", cu_seqlens_stick_size_B},
++    };
++
++    // Writer compile-time args (positional: TensorAccessorArgs only)
++    std::vector<uint32_t> writer_compile_time_args;
++    TensorAccessorArgs(cache_k_buffer).append_to(writer_compile_time_args);
++    TensorAccessorArgs(cache_v_buffer).append_to(writer_compile_time_args);
++    TensorAccessorArgs(page_table_buffer).append_to(writer_compile_time_args);
++    TensorAccessorArgs(start_positions_buffer).append_to(writer_compile_time_args);
++
++    std::unordered_map<std::string, uint32_t> writer_named_ctas = {
++        {"cb_k", cb_k_meta.id},
++        {"cb_v", cb_v_meta.id},
++        {"cb_page_table", cb_page_table_meta.id},
++        {"cb_cu_seqlens", cb_cu_seqlens_meta.id},
++        {"cb_start_positions", cb_start_positions_meta.id},
++        {"num_kv_heads", num_kv_heads},
++        {"total_tokens_t", total_tokens_t},
++        {"block_size_t", block_size_t},
++        {"Wt", Wt},
++        {"page_table_stick_size", page_table_stick_size_B},
++        {"max_batch_size", max_batch_size},
++        {"start_positions_stick_size", start_positions_stick_size_B},
++    };
++
++    tt::tt_metal::KernelHandle reader_kernel_id = tt::tt_metal::CreateKernel(
++        program,
++        "ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/kernels/"
++        "dataflow/reader_fill_cache_varlen.cpp",
++        all_cores,
++        tt::tt_metal::ReaderDataMovementConfig(reader_compile_time_args, {}, reader_named_ctas));
++
++    tt::tt_metal::KernelHandle writer_kernel_id = tt::tt_metal::CreateKernel(
++        program,
++        "ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/kernels/"
++        "dataflow/writer_fill_cache_varlen.cpp",
++        all_cores,
++        tt::tt_metal::WriterDataMovementConfig(writer_compile_time_args, {}, writer_named_ctas));
++
++    uint32_t g1_numcores = core_group_1.num_cores();
++    uint32_t g2_numcores = core_group_2.num_cores();
++
++    const auto& cores = grid_to_cores(num_cores, num_cores_x, num_cores_y, row_major);
++
++    for (uint32_t i = 0, num_blocks_written = 0; i < num_cores; i++) {
++        const CoreCoord& core = cores.at(i);
++        uint32_t num_blocks_per_core = 0;
++        if (i < g1_numcores) {
++            num_blocks_per_core = num_blocks_per_core_group_1;
++        } else if (i < g1_numcores + g2_numcores) {
++            num_blocks_per_core = num_blocks_per_core_group_2;
++        } else {
++            num_blocks_per_core = 0;
++        }
++
++        tt::tt_metal::SetRuntimeArgs(
++            program,
++            reader_kernel_id,
++            core,
++            {
++                k_fill_buffer->address(),
++                v_fill_buffer->address(),
++                cu_seqlens_buffer->address(),
++                num_blocks_written * Wt,  // start_tile_id
++                num_blocks_per_core,
++            });
++
++        tt::tt_metal::SetRuntimeArgs(
++            program,
++            writer_kernel_id,
++            core,
++            {
++                cache_k_buffer->address(),
++                cache_v_buffer->address(),
++                page_table_buffer->address(),
++                start_positions_buffer->address(),
++                num_blocks_written,  // start_row_num
++                num_blocks_per_core,
++            });
++        num_blocks_written += num_blocks_per_core;
++    }
++
++    return {
++        std::move(program),
++        {.reader_kernel_id = reader_kernel_id,
++         .writer_kernel_id = writer_kernel_id,
++         .num_cores = num_cores,
++         .g1_numcores = g1_numcores,
++         .g2_numcores = g2_numcores,
++         .num_blocks_per_core_group_1 = num_blocks_per_core_group_1,
++         .num_blocks_per_core_group_2 = num_blocks_per_core_group_2,
++         .Wt = Wt,
++         .cores = cores}};
++}
++
++void MorehPagedFillCacheVarlenProgramFactory::override_runtime_arguments(
++    cached_program_t& cached_program,
++    const operation_attributes_t&,
++    const tensor_args_t& tensor_args,
++    tensor_return_value_t&) {
++    auto& program = cached_program.program;
++    auto& shared_variables = cached_program.shared_variables;
++
++    auto* k_fill_buffer = tensor_args.k_fill_value.buffer();
++    auto* v_fill_buffer = tensor_args.v_fill_value.buffer();
++    auto* cu_seqlens_buffer = tensor_args.cu_seqlens.buffer();
++    auto* cache_k_buffer = tensor_args.cache_k.buffer();
++    auto* cache_v_buffer = tensor_args.cache_v.buffer();
++    auto* page_table_buffer = tensor_args.page_table.buffer();
++    auto* start_positions_buffer = tensor_args.start_positions.buffer();
++
++    auto& reader_kernel_id = shared_variables.reader_kernel_id;
++    auto& writer_kernel_id = shared_variables.writer_kernel_id;
++    auto& cores = shared_variables.cores;
++    auto& g1_numcores = shared_variables.g1_numcores;
++    auto& g2_numcores = shared_variables.g2_numcores;
++    auto& num_blocks_per_core_group_1 = shared_variables.num_blocks_per_core_group_1;
++    auto& num_blocks_per_core_group_2 = shared_variables.num_blocks_per_core_group_2;
++    auto& Wt = shared_variables.Wt;
++
++    auto& reader_args_by_core = GetRuntimeArgs(program, reader_kernel_id);
++    auto& writer_args_by_core = GetRuntimeArgs(program, writer_kernel_id);
++
++    for (uint32_t i = 0, num_blocks_written = 0; i < cores.size(); i++) {
++        const CoreCoord& core = cores.at(i);
++        uint32_t num_blocks_per_core = 0;
++        if (i < g1_numcores) {
++            num_blocks_per_core = num_blocks_per_core_group_1;
++        } else if (i < g1_numcores + g2_numcores) {
++            num_blocks_per_core = num_blocks_per_core_group_2;
++        } else {
++            num_blocks_per_core = 0;
++        }
++
++        auto& reader_args = reader_args_by_core.at(core.x).at(core.y);
++        reader_args[0] = k_fill_buffer->address();
++        reader_args[1] = v_fill_buffer->address();
++        reader_args[2] = cu_seqlens_buffer->address();
++        reader_args[3] = num_blocks_written * Wt;
++        reader_args[4] = num_blocks_per_core;
++
++        auto& writer_args = writer_args_by_core.at(core.x).at(core.y);
++        writer_args[0] = cache_k_buffer->address();
++        writer_args[1] = cache_v_buffer->address();
++        writer_args[2] = page_table_buffer->address();
++        writer_args[3] = start_positions_buffer->address();
++        writer_args[4] = num_blocks_written;
++        writer_args[5] = num_blocks_per_core;
++
++        num_blocks_written += num_blocks_per_core;
++    }
++}
++
++}  // namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen::program
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_program_factory.hpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_program_factory.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc057fbb6ebaaec25c161c7e3168db8463dc6837
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/device/moreh_paged_fill_cache_varlen_program_factory.hpp
+@@ -0,0 +1,45 @@
++
++#pragma once
++
++#include <vector>
++
++#include <tt-metalium/core_coord.hpp>
++
++#include "moreh_paged_fill_cache_varlen_device_operation_types.hpp"
++#include "ttnn/device_operation.hpp"
++
++namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen::program {
++
++struct MorehPagedFillCacheVarlenSharedVariables {
++    tt::tt_metal::KernelHandle reader_kernel_id;
++    tt::tt_metal::KernelHandle writer_kernel_id;
++    uint32_t num_cores;
++    uint32_t g1_numcores;
++    uint32_t g2_numcores;
++    uint32_t num_blocks_per_core_group_1;
++    uint32_t num_blocks_per_core_group_2;
++    uint32_t Wt;
++    std::vector<CoreCoord> cores;
++};
++
++struct MorehPagedFillCacheVarlenProgramFactory {
++    using shared_variables_t = MorehPagedFillCacheVarlenSharedVariables;
++    using cached_program_t = ttnn::device_operation::CachedProgram<shared_variables_t>;
++
++    using operation_attributes_t = moreh_paged_fill_cache_varlen::operation_attributes_t;
++    using tensor_args_t = moreh_paged_fill_cache_varlen::tensor_args_t;
++    using tensor_return_value_t = moreh_paged_fill_cache_varlen::tensor_return_value_t;
++
++    static cached_program_t create(
++        const operation_attributes_t& operation_attributes,
++        const tensor_args_t& tensor_args,
++        tensor_return_value_t& tensor_return_value);
++
++    static void override_runtime_arguments(
++        cached_program_t& cached_program,
++        const operation_attributes_t& operation_attributes,
++        const tensor_args_t& tensor_args,
++        tensor_return_value_t& tensor_return_value);
++};
++
++}  // namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen::program
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen.cpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..67b44e2112beec0165732489faef3eaf87ad97b2
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen.cpp
+@@ -0,0 +1,20 @@
++
++#include "moreh_paged_fill_cache_varlen.hpp"
++
++#include "device/moreh_paged_fill_cache_varlen_device_operation.hpp"
++
++namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen {
++
++void ExecuteMorehPagedFillCacheVarlen::invoke(
++    const Tensor& k_fill_value,
++    const Tensor& v_fill_value,
++    const Tensor& cu_seqlens,
++    const Tensor& page_table,
++    const Tensor& start_positions,
++    const Tensor& cache_k,
++    const Tensor& cache_v) {
++    ttnn::prim::moreh_paged_fill_cache_varlen(
++        k_fill_value, v_fill_value, cu_seqlens, page_table, start_positions, cache_k, cache_v);
++}
++
++}  // namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen.hpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..25c4e07012d4be2ed6e2a59c8233cc3f381c9407
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen.hpp
+@@ -0,0 +1,31 @@
++
++#pragma once
++
++#include <utility>
++
++#include "ttnn/types.hpp"
++
++namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen {
++
++struct ExecuteMorehPagedFillCacheVarlen {
++    static void invoke(
++        const Tensor& k_fill_value,
++        const Tensor& v_fill_value,
++        const Tensor& cu_seqlens,
++        const Tensor& page_table,
++        const Tensor& start_positions,
++        const Tensor& cache_k,
++        const Tensor& cache_v);
++};
++
++}  // namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen
++
++namespace ttnn::experimental {
++
++template <typename... Args>
++decltype(auto) moreh_paged_fill_cache_varlen(Args&&... args) {
++    return ttnn::operations::experimental::moreh_paged_fill_cache_varlen::ExecuteMorehPagedFillCacheVarlen::invoke(
++        std::forward<Args>(args)...);
++}
++
++}  // namespace ttnn::experimental
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen_nanobind.cpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen_nanobind.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..74ecc7498058efa00de85102872922f8766f75d1
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen_nanobind.cpp
+@@ -0,0 +1,73 @@
++
++#include "moreh_paged_fill_cache_varlen_nanobind.hpp"
++
++#include <nanobind/nanobind.h>
++#include <nanobind/stl/optional.h>
++#include <nanobind/stl/vector.h>
++
++#include "moreh_paged_fill_cache_varlen.hpp"
++#include "ttnn-nanobind/bind_function.hpp"
++
++namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen::detail {
++
++namespace nb = nanobind;
++
++void bind_moreh_paged_fill_cache_varlen(nb::module_& module) {
++    ttnn::bind_function<"moreh_paged_fill_cache_varlen", "ttnn.experimental.">(
++        module,
++        R"doc(
++moreh_paged_fill_cache_varlen(
++    k_fill_value: ttnn.Tensor,
++    v_fill_value: ttnn.Tensor,
++    cu_seqlens: ttnn.Tensor,
++    page_table: ttnn.Tensor,
++    start_positions: ttnn.Tensor,
++    cache_k: ttnn.Tensor,
++    cache_v: ttnn.Tensor,
++    *,
++    mesh_coords: set[ttnn.MeshCoordinate] = None
++) -> None
++
++Fill paged KV cache in-place from packed variable-length K/V tensors.
++
++This operation fills cache_k and cache_v in-place using packed (concatenated) key/value tensors
++with variable-length sequences indicated by cu_seqlens. Supports chunked prefill via start_positions.
++
++Args:
++    * :attr:`k_fill_value`: Packed key tensor [1, num_kv_heads, total_tokens, head_dim]
++    * :attr:`v_fill_value`: Packed value tensor [1, num_kv_heads, total_tokens, head_dim]
++    * :attr:`cu_seqlens`: Cumulative sequence lengths [max_batch_size + 1], INT32, ROW_MAJOR
++    * :attr:`page_table`: Page table [batch_size, max_num_blocks_per_seq], INT32, ROW_MAJOR
++    * :attr:`start_positions`: Per-request cache start positions [batch_size], INT32, ROW_MAJOR (must be multiples of 32)
++    * :attr:`cache_k`: Paged key cache [max_num_blocks, num_kv_heads, block_size, head_dim]
++    * :attr:`cache_v`: Paged value cache [max_num_blocks, num_kv_heads, block_size, head_dim]
++
++Keyword Args:
++    * :attr:`mesh_coords`: Optional set of mesh coordinates to execute on.
++
++Example:
++    >>> ttnn.experimental.moreh_paged_fill_cache_varlen(
++    ...     k_packed, v_packed, cu_seqlens, page_table, start_positions, cache_k, cache_v)
++)doc",
++        ttnn::overload_t{
++            +[](const ttnn::Tensor& k_fill_value,
++                const ttnn::Tensor& v_fill_value,
++                const ttnn::Tensor& cu_seqlens,
++                const ttnn::Tensor& page_table,
++                const ttnn::Tensor& start_positions,
++                const ttnn::Tensor& cache_k,
++                const ttnn::Tensor& cache_v) {
++                return ttnn::experimental::moreh_paged_fill_cache_varlen(
++                    k_fill_value, v_fill_value, cu_seqlens, page_table, start_positions, cache_k, cache_v);
++            },
++            nb::arg("k_fill_value").noconvert(),
++            nb::arg("v_fill_value").noconvert(),
++            nb::arg("cu_seqlens").noconvert(),
++            nb::arg("page_table").noconvert(),
++            nb::arg("start_positions").noconvert(),
++            nb::arg("cache_k").noconvert(),
++            nb::arg("cache_v").noconvert(),
++        });
++}
++
++}  // namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen::detail
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen_nanobind.hpp b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen_nanobind.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..194a8799b0ec3efb14a7105a56460c08ec7e8b73
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen_nanobind.hpp
+@@ -0,0 +1,12 @@
++
++#pragma once
++
++#include "ttnn-nanobind/nanobind_fwd.hpp"
++
++namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen::detail {
++
++namespace nb = nanobind;
++
++void bind_moreh_paged_fill_cache_varlen(nb::module_& module);
++
++}  // namespace ttnn::operations::experimental::moreh_paged_fill_cache_varlen::detail
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_raw_byte_copy/moreh_raw_byte_copy_nanobind.cpp b/ttnn/cpp/ttnn/operations/experimental/moreh_raw_byte_copy/moreh_raw_byte_copy_nanobind.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..75e1d327d648232a30ca85fcd0f9b2ba4345d30f
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_raw_byte_copy/moreh_raw_byte_copy_nanobind.cpp
+@@ -0,0 +1,1531 @@
++#include "moreh_raw_byte_copy_nanobind.hpp"
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include <nanobind/nanobind.h>
++#include <nanobind/ndarray.h>
++#include <nanobind/stl/optional.h>
++#include <nanobind/stl/vector.h>
++
++#include "ttnn/common/queue_id.hpp"
++#include "ttnn/distributed/api.hpp"
++#include "ttnn/tensor/tensor.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
++
++#include <tt-metalium/buffer.hpp>
++#include <tt-metalium/experimental/pinned_memory.hpp>
++#include <tt-metalium/experimental/tensor/tensor_apis.hpp>
++#include <tt-metalium/mesh_buffer.hpp>
++#include <tt-metalium/mesh_command_queue.hpp>
++#include <tt-metalium/mesh_coord.hpp>
++#include <tt-metalium/mesh_device.hpp>
++
++namespace ttnn::operations::experimental::moreh_raw_byte_copy::detail {
++
++namespace nb = nanobind;
++
++using CpuUint8Tensor = nb::ndarray<nb::array_api, uint8_t, nb::c_contig, nb::device::cpu>;
++using CpuInt64Tensor = nb::ndarray<nb::array_api, int64_t, nb::c_contig, nb::device::cpu>;
++
++std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> mesh_buffer_view(const ttnn::Tensor& tensor) {
++    const auto& backing = tensor.device_storage().get_mesh_buffer();
++    return tt::tt_metal::distributed::MeshBuffer::create(
++        backing.global_config(), backing.device_local_config(), backing.device(), backing.address());
++}
++
++bool is_supported_raw_byte_tensor(const ttnn::Tensor& tensor) {
++    const bool is_uint8_rm =
++        tensor.dtype() == tt::tt_metal::DataType::UINT8 && tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR;
++    const bool is_bfp8_tile =
++        tensor.dtype() == tt::tt_metal::DataType::BFLOAT8_B && tensor.layout() == tt::tt_metal::Layout::TILE;
++    return is_uint8_rm || is_bfp8_tile;
++}
++
++void validate_raw_byte_device_tensor(const ttnn::Tensor& tensor, const char* name) {
++    const bool is_device = tensor.storage_type() == tt::tt_metal::StorageType::DEVICE;
++    TT_FATAL(is_device, "{} must be on device", name);
++
++    const bool has_buffer = tensor.buffer() != nullptr;
++    TT_FATAL(has_buffer, "{} must have a device buffer", name);
++
++    const bool is_supported = is_supported_raw_byte_tensor(tensor);
++    TT_FATAL(
++        is_supported,
++        "{} must be UINT8 ROW_MAJOR or BFLOAT8_B TILE, got dtype={} layout={}",
++        name,
++        tensor.dtype(),
++        tensor.layout());
++
++    const bool is_interleaved = tensor.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED;
++    TT_FATAL(is_interleaved, "{} must use interleaved memory layout", name);
++}
++
++bool is_single_coord_mesh_view(const ttnn::Tensor& tensor) {
++    return tensor.device()->num_devices() > 1 && tensor.device_storage().get_coords().size() == 1;
++}
++
++// Temporary GLM51 toy P/D support path: some raw-cache tensors can be views on a
++// single coordinate of a multi-device mesh. Keep this branch narrow until the
++// underlying mesh tensor host-copy API handles that case directly.
++void copy_single_coord_mesh_view_to_torch(
++    const ttnn::Tensor& device_tensor,
++    uint8_t* dst,
++    const std::optional<tt::tt_metal::BufferRegion>& region,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    const auto& coords = device_tensor.device_storage().get_coords();
++    tt::tt_metal::distributed::ShardDataTransfer transfer{coords.front()};
++    transfer.host_data(reinterpret_cast<void*>(dst)).region(region);
++    auto& cq = device_tensor.device()->mesh_command_queue(tt::tt_metal::raw_optional(cq_id));
++    cq.enqueue_read_shards({transfer}, mesh_buffer_view(device_tensor), blocking);
++}
++
++// See copy_single_coord_mesh_view_to_torch(). This mirrors the same temporary
++// shard-copy handling for host-to-device writes.
++void copy_single_coord_mesh_view_from_torch(
++    const uint8_t* src,
++    ttnn::Tensor& device_tensor,
++    const std::optional<tt::tt_metal::BufferRegion>& region,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    const auto& coords = device_tensor.device_storage().get_coords();
++    tt::tt_metal::distributed::ShardDataTransfer transfer{coords.front()};
++    transfer.host_data(const_cast<uint8_t*>(src)).region(region);
++    auto& cq = device_tensor.device()->mesh_command_queue(tt::tt_metal::raw_optional(cq_id));
++    cq.enqueue_write_shards(mesh_buffer_view(device_tensor), {transfer}, blocking);
++}
++
++struct RawCopyRegion {
++    uint32_t offset;
++    uint32_t bytes;
++};
++
++struct RegionRawByteRun {
++    uint32_t shard_index;
++    uint32_t device_byte_offset;
++    uint32_t num_bytes;
++    uint64_t host_byte_offset;
++};
++
++bool fits_u32(int64_t value) {
++    return value >= 0 && static_cast<uint64_t>(value) <= std::numeric_limits<uint32_t>::max();
++}
++
++bool fits_host_offset(int64_t value) {
++    return value >= 0 && static_cast<uint64_t>(value) <= std::numeric_limits<size_t>::max();
++}
++
++bool append_region_raw_member_run(
++    std::vector<RegionRawByteRun>& runs,
++    int64_t shard_index,
++    int64_t src_row,
++    int64_t rows,
++    int64_t dst_row,
++    int64_t member_width,
++    int64_t member_alloc_bytes,
++    int64_t region_base,
++    int64_t memobj_slot) {
++    const int64_t src_byte_offset = src_row * member_width;
++    const int64_t num_bytes = rows * member_width;
++    const int64_t dst_byte_offset = region_base + memobj_slot * member_alloc_bytes + dst_row * member_width;
++    if (!fits_u32(shard_index) || !fits_u32(src_byte_offset) || !fits_u32(num_bytes) ||
++        !fits_host_offset(dst_byte_offset)) {
++        return false;
++    }
++
++    RegionRawByteRun run{
++        static_cast<uint32_t>(shard_index),
++        static_cast<uint32_t>(src_byte_offset),
++        static_cast<uint32_t>(num_bytes),
++        static_cast<uint64_t>(dst_byte_offset)};
++    if (!runs.empty()) {
++        auto& prev = runs.back();
++        if (prev.shard_index == run.shard_index &&
++            static_cast<uint64_t>(prev.device_byte_offset) + prev.num_bytes == run.device_byte_offset &&
++            static_cast<uint64_t>(prev.host_byte_offset) + prev.num_bytes == run.host_byte_offset &&
++            static_cast<uint64_t>(prev.num_bytes) + run.num_bytes <= std::numeric_limits<uint32_t>::max()) {
++            prev.num_bytes += run.num_bytes;
++            return true;
++        }
++    }
++    runs.push_back(run);
++    return true;
++}
++
++bool append_region_raw_explicit_run(
++    std::vector<RegionRawByteRun>& runs,
++    int64_t shard_index,
++    int64_t device_byte_offset,
++    int64_t num_bytes,
++    int64_t host_byte_offset) {
++    if (!fits_u32(shard_index) || !fits_u32(device_byte_offset) || !fits_u32(num_bytes) ||
++        !fits_host_offset(host_byte_offset) || num_bytes <= 0) {
++        return false;
++    }
++
++    RegionRawByteRun run{
++        static_cast<uint32_t>(shard_index),
++        static_cast<uint32_t>(device_byte_offset),
++        static_cast<uint32_t>(num_bytes),
++        static_cast<uint64_t>(host_byte_offset)};
++    if (!runs.empty()) {
++        auto& prev = runs.back();
++        if (prev.shard_index == run.shard_index &&
++            static_cast<uint64_t>(prev.device_byte_offset) + prev.num_bytes == run.device_byte_offset &&
++            static_cast<uint64_t>(prev.host_byte_offset) + prev.num_bytes == run.host_byte_offset &&
++            static_cast<uint64_t>(prev.num_bytes) + run.num_bytes <= std::numeric_limits<uint32_t>::max()) {
++            prev.num_bytes += run.num_bytes;
++            return true;
++        }
++    }
++    runs.push_back(run);
++    return true;
++}
++
++int64_t mesh_shard_index(
++    int64_t group, int64_t shard, int64_t group_size, int64_t shard_count, int64_t group_axis, int64_t shard_axis) {
++    // The caller validates axes. Flatten the logical 2D mesh in row-major
++    // order: flat_index = coords[0] * axis_sizes[1] + coords[1].
++    int64_t axis_sizes[2] = {0, 0};
++    int64_t coords[2] = {0, 0};
++    axis_sizes[group_axis] = group_size;
++    axis_sizes[shard_axis] = shard_count;
++    coords[group_axis] = group;
++    coords[shard_axis] = shard;
++    return coords[0] * axis_sizes[1] + coords[1];
++}
++
++std::optional<std::vector<std::vector<RegionRawByteRun>>> build_region_raw_mesh_runs(
++    CpuInt64Tensor slot_mapping,
++    const std::vector<int64_t>& starts,
++    const std::vector<int64_t>& ends,
++    const std::vector<int64_t>& memobj_slots,
++    const std::vector<int64_t>& member_alloc_bytes,
++    const std::vector<int64_t>& region_bases,
++    const std::vector<int64_t>& member_widths,
++    int64_t block_size,
++    int64_t dp_size,
++    int64_t blocks_per_dp,
++    int64_t tp_size,
++    int64_t rank,
++    int64_t group_axis = 0,
++    int64_t shard_axis = 1) {
++    const size_t chunks = memobj_slots.size();
++    const size_t members = member_widths.size();
++    if (chunks == 0 || starts.size() != chunks || ends.size() != chunks || members == 0 ||
++        member_alloc_bytes.size() != members || region_bases.size() != members) {
++        return std::nullopt;
++    }
++    if (slot_mapping.ndim() != 1 || block_size <= 0 || dp_size <= 0 || blocks_per_dp <= 0 || tp_size <= 0 || rank < 0 ||
++        rank >= tp_size || group_axis < 0 || group_axis > 1 || shard_axis < 0 || shard_axis > 1 ||
++        group_axis == shard_axis) {
++        return std::nullopt;
++    }
++
++    std::vector<int64_t> member_rows;
++    member_rows.reserve(members);
++    for (size_t member = 0; member < members; ++member) {
++        const int64_t width = member_widths.at(member);
++        const int64_t alloc_bytes = member_alloc_bytes.at(member);
++        if (width <= 0 || alloc_bytes <= 0 || alloc_bytes % width != 0) {
++            return std::nullopt;
++        }
++        member_rows.push_back(alloc_bytes / width);
++    }
++    const int64_t target_rows = member_rows.front();
++    if (target_rows <= 0 || target_rows % block_size != 0) {
++        return std::nullopt;
++    }
++    for (int64_t rows : member_rows) {
++        if (rows != target_rows) {
++            return std::nullopt;
++        }
++    }
++
++    const int64_t num_slots = static_cast<int64_t>(slot_mapping.shape(0));
++    const int64_t rows_per_dp = blocks_per_dp * block_size;
++    const int64_t num_device_tensors = dp_size * tp_size;
++    const int64_t* slots = slot_mapping.data();
++    std::vector<std::vector<RegionRawByteRun>> member_runs(members);
++    for (size_t member = 0; member < members; ++member) {
++        member_runs[member].reserve(chunks);
++    }
++
++    for (size_t chunk = 0; chunk < chunks; ++chunk) {
++        const int64_t start = starts.at(chunk);
++        const int64_t end = ends.at(chunk);
++        if (start < 0 || end <= start || end > num_slots || end - start > target_rows) {
++            return std::nullopt;
++        }
++
++        const int64_t logical_rows = end - start;
++        const int64_t first_slot = slots[start];
++        if (first_slot < 0 || first_slot % block_size != 0) {
++            return std::nullopt;
++        }
++
++        for (int64_t row = 0; row < target_rows; row += block_size) {
++            const int64_t slot = row < logical_rows ? slots[start + row] : first_slot + row;
++            if (slot < 0 || slot % block_size != 0) {
++                return std::nullopt;
++            }
++            if (row < logical_rows) {
++                int64_t rows_to_check = logical_rows - row;
++                if (rows_to_check > block_size) {
++                    rows_to_check = block_size;
++                }
++                for (int64_t intra = 0; intra < rows_to_check; ++intra) {
++                    if (slots[start + row + intra] != slot + intra) {
++                        return std::nullopt;
++                    }
++                }
++            }
++
++            const int64_t block = slot / block_size;
++            const int64_t dp = block / blocks_per_dp;
++            if (dp < 0 || dp >= dp_size) {
++                return std::nullopt;
++            }
++            const int64_t local_src_row = (block - dp * blocks_per_dp) * block_size;
++            if (local_src_row < 0 || local_src_row + block_size > rows_per_dp) {
++                return std::nullopt;
++            }
++            const int64_t shard_index = mesh_shard_index(dp, rank, dp_size, tp_size, group_axis, shard_axis);
++            if (shard_index < 0 || shard_index >= num_device_tensors) {
++                return std::nullopt;
++            }
++
++            for (size_t member = 0; member < members; ++member) {
++                if (!append_region_raw_member_run(
++                        member_runs[member],
++                        shard_index,
++                        local_src_row,
++                        block_size,
++                        row,
++                        member_widths.at(member),
++                        member_alloc_bytes.at(member),
++                        region_bases.at(member),
++                        memobj_slots.at(chunk))) {
++                    return std::nullopt;
++                }
++            }
++        }
++    }
++
++    return member_runs;
++}
++
++std::optional<std::vector<std::vector<RegionRawByteRun>>> build_tp_interleaved_region_raw_mesh_runs(
++    CpuInt64Tensor slot_mapping,
++    const std::vector<int64_t>& starts,
++    const std::vector<int64_t>& ends,
++    const std::vector<int64_t>& memobj_slots,
++    const std::vector<int64_t>& member_alloc_bytes,
++    const std::vector<int64_t>& region_bases,
++    int64_t shard_block_bytes,
++    int64_t block_bytes,
++    int64_t block_size,
++    int64_t dp_size,
++    int64_t blocks_per_dp,
++    int64_t tp_size) {
++    const size_t chunks = memobj_slots.size();
++    const size_t members = member_alloc_bytes.size();
++    if (chunks == 0 || starts.size() != chunks || ends.size() != chunks || members == 0 ||
++        region_bases.size() != members) {
++        return std::nullopt;
++    }
++    if (slot_mapping.ndim() != 1 || shard_block_bytes <= 0 || block_bytes <= 0 || block_size <= 0 || dp_size <= 0 ||
++        blocks_per_dp <= 0 || tp_size <= 0 || block_bytes != shard_block_bytes * tp_size) {
++        return std::nullopt;
++    }
++
++    std::vector<int64_t> member_blocks;
++    member_blocks.reserve(members);
++    for (size_t member = 0; member < members; ++member) {
++        const int64_t alloc_bytes = member_alloc_bytes.at(member);
++        if (alloc_bytes <= 0 || alloc_bytes % block_bytes != 0) {
++            return std::nullopt;
++        }
++        member_blocks.push_back(alloc_bytes / block_bytes);
++    }
++
++    const int64_t num_slots = static_cast<int64_t>(slot_mapping.shape(0));
++    const int64_t num_device_tensors = dp_size * tp_size;
++    const int64_t* slots = slot_mapping.data();
++    std::vector<std::vector<RegionRawByteRun>> member_runs(members);
++
++    for (size_t chunk = 0; chunk < chunks; ++chunk) {
++        const int64_t start = starts.at(chunk);
++        const int64_t end = ends.at(chunk);
++        if (start < 0 || end < start || end > num_slots) {
++            return std::nullopt;
++        }
++        const int64_t logical_rows = end - start;
++        if (logical_rows == 0) {
++            continue;
++        }
++
++        const int64_t first_slot = slots[start];
++        if (first_slot < 0 || first_slot % block_size != 0) {
++            return std::nullopt;
++        }
++
++        std::vector<int64_t> blocks;
++        blocks.reserve((logical_rows + block_size - 1) / block_size);
++        for (int64_t pos = 0; pos < logical_rows; ++pos) {
++            const int64_t slot = slots[start + pos];
++            if (slot < 0) {
++                return std::nullopt;
++            }
++            const int64_t block = slot / block_size;
++            const int64_t intra = slot % block_size;
++            if (intra != pos % block_size) {
++                return std::nullopt;
++            }
++            if (intra == 0) {
++                blocks.push_back(block);
++            } else if (blocks.empty() || blocks.back() != block) {
++                return std::nullopt;
++            }
++        }
++
++        for (int64_t member_block_count : member_blocks) {
++            if (static_cast<int64_t>(blocks.size()) > member_block_count) {
++                return std::nullopt;
++            }
++        }
++
++        for (size_t chunk_block = 0; chunk_block < blocks.size(); ++chunk_block) {
++            const int64_t block = blocks.at(chunk_block);
++            const int64_t dp = block / blocks_per_dp;
++            const int64_t local_block = block - dp * blocks_per_dp;
++            if (dp < 0 || dp >= dp_size || local_block < 0 || local_block >= blocks_per_dp) {
++                return std::nullopt;
++            }
++            for (int64_t tp_rank = 0; tp_rank < tp_size; ++tp_rank) {
++                const int64_t shard_index = dp * tp_size + tp_rank;
++                if (shard_index < 0 || shard_index >= num_device_tensors) {
++                    return std::nullopt;
++                }
++                const int64_t device_byte_offset = local_block * shard_block_bytes;
++                const int64_t member_block_offset = static_cast<int64_t>(chunk_block) * block_bytes;
++                const int64_t tp_host_offset = tp_rank * shard_block_bytes;
++                for (size_t member = 0; member < members; ++member) {
++                    const int64_t host_byte_offset = region_bases.at(member) +
++                                                     memobj_slots.at(chunk) * member_alloc_bytes.at(member) +
++                                                     member_block_offset + tp_host_offset;
++                    if (!append_region_raw_explicit_run(
++                            member_runs.at(member),
++                            shard_index,
++                            device_byte_offset,
++                            shard_block_bytes,
++                            host_byte_offset)) {
++                        return std::nullopt;
++                    }
++                }
++            }
++        }
++    }
++
++    return member_runs;
++}
++
++std::optional<std::vector<std::vector<RegionRawByteRun>>> build_dsa_block_cyclic_region_raw_mesh_runs(
++    CpuInt64Tensor slot_mapping,
++    const std::vector<int64_t>& starts,
++    const std::vector<int64_t>& ends,
++    const std::vector<int64_t>& memobj_slots,
++    const std::vector<int64_t>& member_alloc_bytes,
++    const std::vector<int64_t>& region_bases,
++    const std::vector<int64_t>& member_widths,
++    const std::vector<int64_t>& source_starts,
++    int64_t block_size,
++    int64_t blocks_per_rank,
++    int64_t block_cyclic_degree) {
++    TT_FATAL(member_widths.size() == 2, "DSA block-cyclic raw copy expects exactly latent/indexer members");
++    TT_FATAL(member_alloc_bytes.size() == 2, "DSA block-cyclic raw copy expects exactly two member alloc sizes");
++    TT_FATAL(region_bases.size() == 2, "DSA block-cyclic raw copy expects exactly two region bases");
++    const size_t chunks = memobj_slots.size();
++    const size_t members = member_widths.size();
++    if (chunks == 0 || starts.size() != chunks || ends.size() != chunks || members == 0 ||
++        member_alloc_bytes.size() != members || region_bases.size() != members ||
++        (!source_starts.empty() && source_starts.size() != chunks)) {
++        return std::nullopt;
++    }
++    if (slot_mapping.ndim() != 1 || block_size <= 0 || blocks_per_rank <= 0 || block_cyclic_degree <= 0) {
++        return std::nullopt;
++    }
++
++    std::vector<int64_t> member_block_bytes;
++    std::vector<int64_t> member_blocks;
++    member_block_bytes.reserve(members);
++    member_blocks.reserve(members);
++    for (size_t member = 0; member < members; ++member) {
++        const int64_t width = member_widths.at(member);
++        const int64_t alloc_bytes = member_alloc_bytes.at(member);
++        if (width <= 0 || alloc_bytes <= 0) {
++            return std::nullopt;
++        }
++        const int64_t block_bytes = width * block_size;
++        if (block_bytes <= 0 || alloc_bytes % block_bytes != 0) {
++            return std::nullopt;
++        }
++        member_block_bytes.push_back(block_bytes);
++        member_blocks.push_back(alloc_bytes / block_bytes);
++    }
++    const int64_t target_blocks = member_blocks.front();
++    if (target_blocks <= 0) {
++        return std::nullopt;
++    }
++    for (int64_t blocks : member_blocks) {
++        if (blocks != target_blocks) {
++            return std::nullopt;
++        }
++    }
++
++    const int64_t num_slots = static_cast<int64_t>(slot_mapping.shape(0));
++    const int64_t* slots = slot_mapping.data();
++    auto canonical_physical_block = [&](int64_t local_virtual_block, int64_t fallback_slot) -> std::optional<int64_t> {
++        const int64_t group_start = local_virtual_block * block_size * block_cyclic_degree;
++        const int64_t group_end = std::min(group_start + block_size * block_cyclic_degree, num_slots);
++        if (group_start < 0 || group_start >= group_end) {
++            return fallback_slot / block_size;
++        }
++
++        bool have = false;
++        bool all_blocks_same = true;
++        bool all_bases_same = true;
++        int64_t first_block = 0;
++        int64_t first_base = 0;
++        for (int64_t pos = group_start; pos < group_end; ++pos) {
++            const int64_t observed_slot = slots[pos];
++            if (observed_slot < 0) {
++                continue;
++            }
++            const int64_t block = observed_slot / block_size;
++            const int64_t cp_block_offset = (pos % (block_size * block_cyclic_degree)) / block_size;
++            const int64_t base = block - cp_block_offset;
++            if (!have) {
++                first_block = block;
++                first_base = base;
++                have = true;
++                continue;
++            }
++            all_blocks_same = all_blocks_same && (block == first_block);
++            all_bases_same = all_bases_same && (base == first_base);
++        }
++        if (!have) {
++            return fallback_slot / block_size;
++        }
++        if (all_blocks_same) {
++            return first_block;
++        }
++        if (all_bases_same) {
++            return first_base;
++        }
++        return std::nullopt;
++    };
++    std::vector<std::vector<RegionRawByteRun>> member_runs(members);
++    for (size_t chunk = 0; chunk < chunks; ++chunk) {
++        const int64_t start = starts.at(chunk);
++        const int64_t end = ends.at(chunk);
++        if (start < 0 || start % block_size != 0 || end <= start || end > num_slots) {
++            return std::nullopt;
++        }
++        const int64_t logical_rows = end - start;
++        const int64_t source_start = source_starts.empty() ? 0 : source_starts.at(chunk);
++        if (source_start < 0 || source_start % block_size != 0) {
++            return std::nullopt;
++        }
++        const int64_t source_block_start = source_start / block_size;
++        const int64_t logical_blocks = (logical_rows + block_size - 1) / block_size;
++        if (source_block_start < 0 || source_block_start + logical_blocks > target_blocks) {
++            return std::nullopt;
++        }
++        const int64_t copy_blocks = logical_blocks;
++
++        const int64_t first_slot = slots[start];
++        if (first_slot < 0 || first_slot % block_size != 0) {
++            return std::nullopt;
++        }
++
++        for (int64_t chunk_block = 0; chunk_block < copy_blocks; ++chunk_block) {
++            const int64_t row = chunk_block * block_size;
++            const int64_t slot = slots[start + row];
++            if (slot < 0 || slot % block_size != 0) {
++                return std::nullopt;
++            }
++            if (row < logical_rows) {
++                int64_t rows_to_check = logical_rows - row;
++                if (rows_to_check > block_size) {
++                    rows_to_check = block_size;
++                }
++                for (int64_t intra = 0; intra < rows_to_check; ++intra) {
++                    if (slots[start + row + intra] != slot + intra) {
++                        return std::nullopt;
++                    }
++                }
++            }
++
++            // Match CacheWriteMode.BlockCyclic fill-cache semantics:
++            // token position chooses the CP owner; the page-table entry chooses
++            // the owner-local physical cache block. The slot stream may be
++            // native vLLM block ids or already DCP-local, so canonicalize the
++            // physical page-table block within the CP virtual block group.
++            const int64_t global_virtual_block = (start + row) / block_size;
++            const int64_t shard_index = global_virtual_block % block_cyclic_degree;
++            const int64_t local_virtual_block = global_virtual_block / block_cyclic_degree;
++            const auto physical_block = canonical_physical_block(local_virtual_block, slot);
++            if (!physical_block.has_value() || physical_block.value() <= 0) {
++                return std::nullopt;
++            }
++            const int64_t local_block = physical_block.value();
++            if (local_block < 0 || local_block >= blocks_per_rank) {
++                return std::nullopt;
++            }
++
++            for (size_t member = 0; member < members; ++member) {
++                const int64_t block_bytes = member_block_bytes.at(member);
++                const int64_t device_byte_offset = local_block * block_bytes;
++                const int64_t host_block = source_block_start + chunk_block;
++                const int64_t host_byte_offset = region_bases.at(member) +
++                                                 memobj_slots.at(chunk) * member_alloc_bytes.at(member) +
++                                                 host_block * block_bytes;
++                if (!append_region_raw_explicit_run(
++                        member_runs.at(member), shard_index, device_byte_offset, block_bytes, host_byte_offset)) {
++                    return std::nullopt;
++                }
++            }
++        }
++    }
++
++    return member_runs;
++}
++
++std::vector<uint32_t> member_byte_counts(const std::vector<std::vector<RegionRawByteRun>>& member_runs) {
++    std::vector<uint32_t> counts;
++    counts.reserve(member_runs.size());
++    for (const auto& runs : member_runs) {
++        uint64_t total = 0;
++        for (const auto& run : runs) {
++            total += run.num_bytes;
++            TT_FATAL(total <= std::numeric_limits<uint32_t>::max(), "region raw member bytes exceed u32");
++        }
++        counts.push_back(static_cast<uint32_t>(total));
++    }
++    return counts;
++}
++
++void gather_region_raw_runs_to_torch(
++    const ttnn::Tensor& device_tensor,
++    const CpuUint8Tensor& dst,
++    const std::vector<RegionRawByteRun>& runs,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id,
++    const char* tensor_name) {
++    const auto shards = ttnn::distributed::get_device_tensors(device_tensor);
++    TT_FATAL(!shards.empty(), "{} has no mesh shards", tensor_name);
++    if (runs.empty()) {
++        return;
++    }
++
++    std::vector<tt::tt_metal::distributed::ShardDataTransfer> transfers;
++    transfers.reserve(runs.size());
++    for (size_t run_index = 0; run_index < runs.size(); ++run_index) {
++        const auto& run = runs.at(run_index);
++        TT_FATAL(
++            run.shard_index < shards.size(),
++            "{} gather run {} shard_index {} exceeds shard count {}",
++            tensor_name,
++            run_index,
++            run.shard_index,
++            shards.size());
++        TT_FATAL(run.num_bytes > 0, "{} gather run {} num_bytes must be > 0", tensor_name, run_index);
++
++        const auto& shard = shards.at(run.shard_index);
++        validate_raw_byte_device_tensor(shard, tensor_name);
++        const auto& coords = shard.device_storage().get_coords();
++        TT_FATAL(
++            coords.size() == 1, "{} shard {} maps to {} mesh coordinates", tensor_name, run.shard_index, coords.size());
++
++        const uint32_t shard_bytes = shard.buffer()->size();
++        TT_FATAL(
++            static_cast<uint64_t>(run.device_byte_offset) + static_cast<uint64_t>(run.num_bytes) <= shard_bytes,
++            "{} gather run {} source region [{}, {}) exceeds shard {} size {}",
++            tensor_name,
++            run_index,
++            run.device_byte_offset,
++            run.device_byte_offset + run.num_bytes,
++            run.shard_index,
++            shard_bytes);
++        const uint32_t page_size = shard.buffer()->page_size();
++        TT_FATAL(
++            run.device_byte_offset % page_size == 0 && run.num_bytes % page_size == 0,
++            "{} gather run {} source region offset={} bytes={} must align to shard page size {}",
++            tensor_name,
++            run_index,
++            run.device_byte_offset,
++            run.num_bytes,
++            page_size);
++        TT_FATAL(
++            static_cast<uint64_t>(run.host_byte_offset) + static_cast<uint64_t>(run.num_bytes) <= dst.size(),
++            "{} gather run {} dst offset {} plus copy size {} exceeds destination size {}",
++            tensor_name,
++            run_index,
++            run.host_byte_offset,
++            run.num_bytes,
++            dst.size());
++
++        const std::optional<tt::tt_metal::BufferRegion> copy_region =
++            run.device_byte_offset == 0 && run.num_bytes == shard_bytes
++                ? std::nullopt
++                : std::make_optional<tt::tt_metal::BufferRegion>(run.device_byte_offset, run.num_bytes);
++        auto transfer = tt::tt_metal::distributed::ShardDataTransfer{coords.front()}
++                            .host_data(static_cast<void*>(dst.data() + run.host_byte_offset))
++                            .region(copy_region);
++        transfers.push_back(std::move(transfer));
++    }
++
++    auto& cq = device_tensor.device()->mesh_command_queue(tt::tt_metal::raw_optional(cq_id));
++    cq.enqueue_read_shards(transfers, mesh_buffer_view(device_tensor), blocking);
++}
++
++void scatter_region_raw_runs_from_torch(
++    const CpuUint8Tensor& src,
++    ttnn::Tensor& device_tensor,
++    const std::vector<RegionRawByteRun>& runs,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id,
++    const char* tensor_name) {
++    const auto shards = ttnn::distributed::get_device_tensors(device_tensor);
++    TT_FATAL(!shards.empty(), "{} has no mesh shards", tensor_name);
++    if (runs.empty()) {
++        return;
++    }
++
++    std::vector<tt::tt_metal::distributed::ShardDataTransfer> transfers;
++    transfers.reserve(runs.size());
++    for (size_t run_index = 0; run_index < runs.size(); ++run_index) {
++        const auto& run = runs.at(run_index);
++        TT_FATAL(
++            run.shard_index < shards.size(),
++            "{} scatter run {} shard_index {} exceeds shard count {}",
++            tensor_name,
++            run_index,
++            run.shard_index,
++            shards.size());
++        TT_FATAL(run.num_bytes > 0, "{} scatter run {} num_bytes must be > 0", tensor_name, run_index);
++
++        const auto& shard = shards.at(run.shard_index);
++        validate_raw_byte_device_tensor(shard, tensor_name);
++        const auto& coords = shard.device_storage().get_coords();
++        TT_FATAL(
++            coords.size() == 1, "{} shard {} maps to {} mesh coordinates", tensor_name, run.shard_index, coords.size());
++
++        const uint32_t shard_bytes = shard.buffer()->size();
++        TT_FATAL(
++            static_cast<uint64_t>(run.device_byte_offset) + static_cast<uint64_t>(run.num_bytes) <= shard_bytes,
++            "{} scatter run {} destination region [{}, {}) exceeds shard {} size {}",
++            tensor_name,
++            run_index,
++            run.device_byte_offset,
++            run.device_byte_offset + run.num_bytes,
++            run.shard_index,
++            shard_bytes);
++        const uint32_t page_size = shard.buffer()->page_size();
++        TT_FATAL(
++            run.device_byte_offset % page_size == 0 && run.num_bytes % page_size == 0,
++            "{} scatter run {} destination region offset={} bytes={} must align to shard page size {}",
++            tensor_name,
++            run_index,
++            run.device_byte_offset,
++            run.num_bytes,
++            page_size);
++        TT_FATAL(
++            static_cast<uint64_t>(run.host_byte_offset) + static_cast<uint64_t>(run.num_bytes) <= src.size(),
++            "{} scatter run {} src offset {} plus copy size {} exceeds source size {}",
++            tensor_name,
++            run_index,
++            run.host_byte_offset,
++            run.num_bytes,
++            src.size());
++
++        const std::optional<tt::tt_metal::BufferRegion> copy_region =
++            run.device_byte_offset == 0 && run.num_bytes == shard_bytes
++                ? std::nullopt
++                : std::make_optional<tt::tt_metal::BufferRegion>(run.device_byte_offset, run.num_bytes);
++        auto transfer = tt::tt_metal::distributed::ShardDataTransfer{coords.front()}
++                            .host_data(static_cast<void*>(src.data() + run.host_byte_offset))
++                            .region(copy_region);
++        transfers.push_back(std::move(transfer));
++    }
++
++    auto& cq = device_tensor.device()->mesh_command_queue(tt::tt_metal::raw_optional(cq_id));
++    cq.enqueue_write_shards(mesh_buffer_view(device_tensor), transfers, blocking);
++}
++
++std::vector<uint32_t> fused_region_raw_gather_to_torch(
++    const ttnn::Tensor& latent_tensor,
++    const ttnn::Tensor& indexer_tensor,
++    CpuUint8Tensor dst,
++    CpuInt64Tensor slot_mapping,
++    const std::vector<int64_t>& starts,
++    const std::vector<int64_t>& ends,
++    const std::vector<int64_t>& memobj_slots,
++    const std::vector<int64_t>& member_alloc_bytes,
++    const std::vector<int64_t>& region_bases,
++    const std::vector<int64_t>& member_widths,
++    int64_t block_size,
++    int64_t dp_size,
++    int64_t blocks_per_dp,
++    int64_t tp_size,
++    int64_t rank,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    validate_raw_byte_device_tensor(latent_tensor, "latent_tensor");
++    validate_raw_byte_device_tensor(indexer_tensor, "indexer_tensor");
++    auto member_runs = build_region_raw_mesh_runs(
++        slot_mapping,
++        starts,
++        ends,
++        memobj_slots,
++        member_alloc_bytes,
++        region_bases,
++        member_widths,
++        block_size,
++        dp_size,
++        blocks_per_dp,
++        tp_size,
++        rank);
++    TT_FATAL(member_runs.has_value(), "region raw fused gather cannot represent this transfer as raw runs");
++    TT_FATAL(member_runs->size() >= 2, "region raw fused gather expects at least two member run lists");
++    auto bytes = member_byte_counts(*member_runs);
++    gather_region_raw_runs_to_torch(latent_tensor, dst, member_runs->at(0), blocking, cq_id, "latent_tensor shard");
++    gather_region_raw_runs_to_torch(indexer_tensor, dst, member_runs->at(1), blocking, cq_id, "indexer_tensor shard");
++    return bytes;
++}
++
++std::vector<uint32_t> fused_tp_interleaved_region_raw_gather_to_torch(
++    const ttnn::Tensor& cache_k,
++    const ttnn::Tensor& cache_v,
++    CpuUint8Tensor dst,
++    CpuInt64Tensor slot_mapping,
++    const std::vector<int64_t>& starts,
++    const std::vector<int64_t>& ends,
++    const std::vector<int64_t>& memobj_slots,
++    const std::vector<int64_t>& member_alloc_bytes,
++    const std::vector<int64_t>& region_bases,
++    int64_t shard_block_bytes,
++    int64_t block_bytes,
++    int64_t block_size,
++    int64_t dp_size,
++    int64_t blocks_per_dp,
++    int64_t tp_size,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    validate_raw_byte_device_tensor(cache_k, "cache_k");
++    validate_raw_byte_device_tensor(cache_v, "cache_v");
++    auto member_runs = build_tp_interleaved_region_raw_mesh_runs(
++        slot_mapping,
++        starts,
++        ends,
++        memobj_slots,
++        member_alloc_bytes,
++        region_bases,
++        shard_block_bytes,
++        block_bytes,
++        block_size,
++        dp_size,
++        blocks_per_dp,
++        tp_size);
++    TT_FATAL(member_runs.has_value(), "TP-interleaved region raw fused gather cannot represent this transfer");
++    TT_FATAL(member_runs->size() >= 2, "TP-interleaved region raw fused gather expects K and V member run lists");
++    auto bytes = member_byte_counts(*member_runs);
++    gather_region_raw_runs_to_torch(cache_k, dst, member_runs->at(0), blocking, cq_id, "cache_k");
++    gather_region_raw_runs_to_torch(cache_v, dst, member_runs->at(1), blocking, cq_id, "cache_v");
++    return bytes;
++}
++
++std::vector<uint32_t> fused_dsa_block_cyclic_region_raw_gather_to_torch(
++    const ttnn::Tensor& latent_tensor,
++    const ttnn::Tensor& indexer_tensor,
++    CpuUint8Tensor dst,
++    CpuInt64Tensor slot_mapping,
++    const std::vector<int64_t>& starts,
++    const std::vector<int64_t>& ends,
++    const std::vector<int64_t>& memobj_slots,
++    const std::vector<int64_t>& member_alloc_bytes,
++    const std::vector<int64_t>& region_bases,
++    const std::vector<int64_t>& member_widths,
++    int64_t block_size,
++    int64_t blocks_per_rank,
++    int64_t block_cyclic_degree,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    validate_raw_byte_device_tensor(latent_tensor, "latent_tensor");
++    validate_raw_byte_device_tensor(indexer_tensor, "indexer_tensor");
++    auto member_runs = build_dsa_block_cyclic_region_raw_mesh_runs(
++        slot_mapping,
++        starts,
++        ends,
++        memobj_slots,
++        member_alloc_bytes,
++        region_bases,
++        member_widths,
++        {},
++        block_size,
++        blocks_per_rank,
++        block_cyclic_degree);
++    TT_FATAL(member_runs.has_value(), "DSA block-cyclic region raw fused gather cannot represent this transfer");
++    TT_FATAL(member_runs->size() == 2, "DSA block-cyclic region raw fused gather expects latent/indexer members");
++    auto bytes = member_byte_counts(*member_runs);
++    gather_region_raw_runs_to_torch(latent_tensor, dst, member_runs->at(0), blocking, cq_id, "latent_tensor shard");
++    gather_region_raw_runs_to_torch(indexer_tensor, dst, member_runs->at(1), blocking, cq_id, "indexer_tensor shard");
++    return bytes;
++}
++
++std::vector<uint32_t> replicated_region_raw_scatter_from_torch(
++    CpuUint8Tensor src,
++    ttnn::Tensor& latent_tensor,
++    ttnn::Tensor& indexer_tensor,
++    CpuInt64Tensor slot_mapping,
++    const std::vector<int64_t>& starts,
++    const std::vector<int64_t>& ends,
++    const std::vector<int64_t>& memobj_slots,
++    const std::vector<int64_t>& member_alloc_bytes,
++    const std::vector<int64_t>& region_bases,
++    const std::vector<int64_t>& member_widths,
++    int64_t block_size,
++    int64_t group_size,
++    int64_t blocks_per_group,
++    int64_t shard_count,
++    int64_t group_axis,
++    int64_t shard_axis,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    validate_raw_byte_device_tensor(latent_tensor, "latent_tensor");
++    validate_raw_byte_device_tensor(indexer_tensor, "indexer_tensor");
++    TT_FATAL(group_size > 0, "replicated raw-byte shard scatter requires group_size > 0");
++    TT_FATAL(shard_count > 0, "replicated raw-byte shard scatter requires shard_count > 0");
++    const auto latent_shards = ttnn::distributed::get_device_tensors(latent_tensor);
++    const auto indexer_shards = ttnn::distributed::get_device_tensors(indexer_tensor);
++    TT_FATAL(!latent_shards.empty(), "latent_tensor has no mesh shards");
++    TT_FATAL(!indexer_shards.empty(), "indexer_tensor has no mesh shards");
++    TT_FATAL(
++        latent_shards.size() == indexer_shards.size(),
++        "replicated raw-byte shard scatter requires matching latent/indexer shard counts, got {} and {}",
++        latent_shards.size(),
++        indexer_shards.size());
++    const uint64_t expected_shards = static_cast<uint64_t>(group_size) * static_cast<uint64_t>(shard_count);
++    TT_FATAL(
++        expected_shards == latent_shards.size(),
++        "replicated raw-byte shard scatter group_size={} shard_count={} maps to {} shards, but tensors have {} shards",
++        group_size,
++        shard_count,
++        expected_shards,
++        latent_shards.size());
++
++    std::vector<std::vector<RegionRawByteRun>> all_member_runs(2);
++    for (int64_t shard = 0; shard < shard_count; ++shard) {
++        auto member_runs = build_region_raw_mesh_runs(
++            slot_mapping,
++            starts,
++            ends,
++            memobj_slots,
++            member_alloc_bytes,
++            region_bases,
++            member_widths,
++            block_size,
++            group_size,
++            blocks_per_group,
++            shard_count,
++            shard,
++            group_axis,
++            shard_axis);
++        TT_FATAL(member_runs.has_value(), "replicated raw-byte shard scatter cannot represent shard {}", shard);
++        TT_FATAL(member_runs->size() == 2, "replicated raw-byte shard scatter expects exactly two member run lists");
++        for (std::size_t member = 0; member < all_member_runs.size(); ++member) {
++            all_member_runs[member].insert(
++                all_member_runs[member].end(), member_runs->at(member).begin(), member_runs->at(member).end());
++        }
++    }
++    scatter_region_raw_runs_from_torch(
++        src, latent_tensor, all_member_runs.at(0), blocking, cq_id, "latent_tensor shards");
++    scatter_region_raw_runs_from_torch(
++        src, indexer_tensor, all_member_runs.at(1), blocking, cq_id, "indexer_tensor shards");
++    return member_byte_counts(all_member_runs);
++}
++
++std::vector<uint32_t> fused_region_raw_scatter_from_torch(
++    CpuUint8Tensor src,
++    ttnn::Tensor& latent_tensor,
++    ttnn::Tensor& indexer_tensor,
++    CpuInt64Tensor slot_mapping,
++    const std::vector<int64_t>& starts,
++    const std::vector<int64_t>& ends,
++    const std::vector<int64_t>& memobj_slots,
++    const std::vector<int64_t>& member_alloc_bytes,
++    const std::vector<int64_t>& region_bases,
++    const std::vector<int64_t>& member_widths,
++    int64_t block_size,
++    int64_t dp_size,
++    int64_t blocks_per_dp,
++    int64_t tp_size,
++    int64_t rank,
++    bool replicate_shards,
++    int64_t group_axis,
++    int64_t shard_axis,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    if (replicate_shards) {
++        return replicated_region_raw_scatter_from_torch(
++            src,
++            latent_tensor,
++            indexer_tensor,
++            slot_mapping,
++            starts,
++            ends,
++            memobj_slots,
++            member_alloc_bytes,
++            region_bases,
++            member_widths,
++            block_size,
++            dp_size,
++            blocks_per_dp,
++            tp_size,
++            group_axis,
++            shard_axis,
++            blocking,
++            cq_id);
++    }
++
++    validate_raw_byte_device_tensor(latent_tensor, "latent_tensor");
++    validate_raw_byte_device_tensor(indexer_tensor, "indexer_tensor");
++    auto member_runs = build_region_raw_mesh_runs(
++        slot_mapping,
++        starts,
++        ends,
++        memobj_slots,
++        member_alloc_bytes,
++        region_bases,
++        member_widths,
++        block_size,
++        dp_size,
++        blocks_per_dp,
++        tp_size,
++        rank);
++    TT_FATAL(member_runs.has_value(), "region raw fused scatter cannot represent this transfer as raw runs");
++    TT_FATAL(member_runs->size() >= 2, "region raw fused scatter expects at least two member run lists");
++    auto bytes = member_byte_counts(*member_runs);
++    scatter_region_raw_runs_from_torch(src, latent_tensor, member_runs->at(0), blocking, cq_id, "latent_tensor shard");
++    scatter_region_raw_runs_from_torch(
++        src, indexer_tensor, member_runs->at(1), blocking, cq_id, "indexer_tensor shard");
++    return bytes;
++}
++
++std::vector<uint32_t> fused_tp_interleaved_region_raw_scatter_from_torch(
++    CpuUint8Tensor src,
++    ttnn::Tensor& cache_k,
++    ttnn::Tensor& cache_v,
++    CpuInt64Tensor slot_mapping,
++    const std::vector<int64_t>& starts,
++    const std::vector<int64_t>& ends,
++    const std::vector<int64_t>& memobj_slots,
++    const std::vector<int64_t>& member_alloc_bytes,
++    const std::vector<int64_t>& region_bases,
++    int64_t shard_block_bytes,
++    int64_t block_bytes,
++    int64_t block_size,
++    int64_t dp_size,
++    int64_t blocks_per_dp,
++    int64_t tp_size,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    validate_raw_byte_device_tensor(cache_k, "cache_k");
++    validate_raw_byte_device_tensor(cache_v, "cache_v");
++    auto member_runs = build_tp_interleaved_region_raw_mesh_runs(
++        slot_mapping,
++        starts,
++        ends,
++        memobj_slots,
++        member_alloc_bytes,
++        region_bases,
++        shard_block_bytes,
++        block_bytes,
++        block_size,
++        dp_size,
++        blocks_per_dp,
++        tp_size);
++    TT_FATAL(member_runs.has_value(), "TP-interleaved region raw fused scatter cannot represent this transfer");
++    TT_FATAL(member_runs->size() >= 2, "TP-interleaved region raw fused scatter expects K and V member run lists");
++    auto bytes = member_byte_counts(*member_runs);
++    scatter_region_raw_runs_from_torch(src, cache_k, member_runs->at(0), blocking, cq_id, "cache_k");
++    scatter_region_raw_runs_from_torch(src, cache_v, member_runs->at(1), blocking, cq_id, "cache_v");
++    return bytes;
++}
++
++std::vector<uint32_t> fused_dsa_block_cyclic_region_raw_scatter_from_torch(
++    CpuUint8Tensor src,
++    ttnn::Tensor& latent_tensor,
++    ttnn::Tensor& indexer_tensor,
++    CpuInt64Tensor slot_mapping,
++    const std::vector<int64_t>& starts,
++    const std::vector<int64_t>& ends,
++    const std::vector<int64_t>& memobj_slots,
++    const std::vector<int64_t>& member_alloc_bytes,
++    const std::vector<int64_t>& region_bases,
++    const std::vector<int64_t>& member_widths,
++    const std::vector<int64_t>& source_starts,
++    int64_t block_size,
++    int64_t blocks_per_rank,
++    int64_t block_cyclic_degree,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    validate_raw_byte_device_tensor(latent_tensor, "latent_tensor");
++    validate_raw_byte_device_tensor(indexer_tensor, "indexer_tensor");
++    auto member_runs = build_dsa_block_cyclic_region_raw_mesh_runs(
++        slot_mapping,
++        starts,
++        ends,
++        memobj_slots,
++        member_alloc_bytes,
++        region_bases,
++        member_widths,
++        source_starts,
++        block_size,
++        blocks_per_rank,
++        block_cyclic_degree);
++    TT_FATAL(member_runs.has_value(), "DSA block-cyclic region raw fused scatter cannot represent this transfer");
++    TT_FATAL(member_runs->size() == 2, "DSA block-cyclic region raw fused scatter expects latent/indexer members");
++    auto bytes = member_byte_counts(*member_runs);
++    scatter_region_raw_runs_from_torch(src, latent_tensor, member_runs->at(0), blocking, cq_id, "latent_tensor shard");
++    scatter_region_raw_runs_from_torch(
++        src, indexer_tensor, member_runs->at(1), blocking, cq_id, "indexer_tensor shard");
++    return bytes;
++}
++
++RawCopyRegion validate_raw_copy_region(
++    const ttnn::Tensor& tensor,
++    std::optional<uint32_t> byte_offset,
++    std::optional<uint32_t> num_bytes,
++    size_t host_num_bytes) {
++    const uint32_t offset = byte_offset.value_or(0);
++    const uint32_t buffer_size = tensor.buffer()->size();
++    const uint32_t bytes = num_bytes.value_or(buffer_size);
++    TT_FATAL(bytes <= host_num_bytes, "destination/source tensor has {} bytes, copy needs {}", host_num_bytes, bytes);
++    TT_FATAL(
++        static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) <= buffer_size,
++        "copy region [{}, {}) exceeds device buffer size {}",
++        offset,
++        offset + bytes,
++        buffer_size);
++    return RawCopyRegion{offset, bytes};
++}
++
++bool is_page_aligned_region(const ttnn::Tensor& tensor, const RawCopyRegion& region) {
++    const uint32_t page_size = tensor.buffer()->page_size();
++    return region.offset % page_size == 0 && region.bytes % page_size == 0;
++}
++
++std::optional<tt::tt_metal::BufferRegion> make_aligned_copy_region(
++    const ttnn::Tensor& tensor, const RawCopyRegion& region) {
++    if (region.offset == 0 && region.bytes == tensor.buffer()->size()) {
++        return std::nullopt;
++    }
++    return tt::tt_metal::BufferRegion(region.offset, region.bytes);
++}
++
++RawCopyRegion page_align_region(const ttnn::Tensor& tensor, const RawCopyRegion& region) {
++    const uint32_t page_size = tensor.buffer()->page_size();
++    const uint32_t aligned_offset = (region.offset / page_size) * page_size;
++    const uint32_t end = region.offset + region.bytes;
++    const uint32_t aligned_end = ((end + page_size - 1) / page_size) * page_size;
++    TT_FATAL(aligned_end <= tensor.buffer()->size(), "aligned copy region exceeds device buffer size");
++    return RawCopyRegion{aligned_offset, aligned_end - aligned_offset};
++}
++
++void read_raw_region(
++    const ttnn::Tensor& device_tensor,
++    uint8_t* dst,
++    const RawCopyRegion& region,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    if (is_page_aligned_region(device_tensor, region)) {
++        const auto copy_region = make_aligned_copy_region(device_tensor, region);
++        if (is_single_coord_mesh_view(device_tensor)) {
++            copy_single_coord_mesh_view_to_torch(device_tensor, dst, copy_region, blocking, cq_id);
++            return;
++        }
++        auto& cq = device_tensor.device()->mesh_command_queue(tt::tt_metal::raw_optional(cq_id));
++        tt::tt_metal::copy_to_host(cq, device_tensor, reinterpret_cast<std::byte*>(dst), copy_region, blocking);
++        return;
++    }
++
++    const auto aligned = page_align_region(device_tensor, region);
++    std::vector<uint8_t> tmp(aligned.bytes);
++    read_raw_region(device_tensor, tmp.data(), aligned, true, cq_id);
++    std::memcpy(dst, tmp.data() + (region.offset - aligned.offset), region.bytes);
++}
++
++void write_raw_region(
++    CpuUint8Tensor src,
++    ttnn::Tensor& device_tensor,
++    const RawCopyRegion& region,
++    bool blocking,
++    std::optional<ttnn::QueueId> cq_id) {
++    if (is_page_aligned_region(device_tensor, region)) {
++        const auto copy_region = make_aligned_copy_region(device_tensor, region);
++        if (is_single_coord_mesh_view(device_tensor)) {
++            copy_single_coord_mesh_view_from_torch(src.data(), device_tensor, copy_region, blocking, cq_id);
++            return;
++        }
++        auto& cq = device_tensor.device()->mesh_command_queue(tt::tt_metal::raw_optional(cq_id));
++        tt::tt_metal::copy_to_device(cq, reinterpret_cast<const std::byte*>(src.data()), device_tensor, copy_region);
++        if (blocking) {
++            cq.finish();
++        }
++        return;
++    }
++
++    const auto aligned = page_align_region(device_tensor, region);
++    std::vector<uint8_t> tmp(aligned.bytes);
++    read_raw_region(device_tensor, tmp.data(), aligned, true, cq_id);
++    std::memcpy(tmp.data() + (region.offset - aligned.offset), src.data(), region.bytes);
++    const auto copy_region = make_aligned_copy_region(device_tensor, aligned);
++    if (is_single_coord_mesh_view(device_tensor)) {
++        copy_single_coord_mesh_view_from_torch(tmp.data(), device_tensor, copy_region, true, cq_id);
++        return;
++    }
++    auto& cq = device_tensor.device()->mesh_command_queue(tt::tt_metal::raw_optional(cq_id));
++    tt::tt_metal::copy_to_device(cq, reinterpret_cast<const std::byte*>(tmp.data()), device_tensor, copy_region);
++    // The temporary staging buffer is owned by this function, so the RMW path
++    // must finish before returning even when the caller requests async writes.
++    cq.finish();
++}
++
++ttnn::Tensor noc_map_host_tensor(const ttnn::Tensor& source, tt::tt_metal::distributed::MeshDevice& mesh_device) {
++    TT_FATAL(source.storage_type() == tt::tt_metal::StorageType::HOST, "source must be a host tensor");
++    TT_FATAL(
++        mesh_device.shape().mesh_size() == 1,
++        "moreh_noc_map_host_tensor currently requires a single-device mesh, got shape {}",
++        mesh_device.shape());
++    const auto& host_tensor = source.host_tensor();
++    TT_FATAL(
++        host_tensor.buffer().shard_coords().size() == 1,
++        "moreh_noc_map_host_tensor requires exactly one populated host shard, got {}",
++        host_tensor.buffer().shard_coords().size());
++
++    const auto pinning = tt::tt_metal::experimental::GetMemoryPinningParameters(mesh_device);
++    TT_FATAL(pinning.can_map_to_noc, "host memory cannot be mapped to NoC on this system");
++    const auto device_range = tt::tt_metal::distributed::MeshCoordinateRangeSet(
++        tt::tt_metal::distributed::MeshCoordinateRange(mesh_device.shape()));
++    auto pinned_host_tensor = host_tensor.transform([&](const tt::tt_metal::HostBuffer& source_buffer) {
++        auto pinned_buffer = source_buffer;
++        TT_FATAL(
++            tt::tt_metal::experimental::HostBufferGetPinnedMemory(pinned_buffer) == nullptr,
++            "source host tensor is already pinned");
++        auto pinned_memory = tt::tt_metal::experimental::PinnedMemory::Create(
++            mesh_device, device_range, pinned_buffer, /*map_to_noc=*/true);
++        const auto coord = tt::tt_metal::distributed::MeshCoordinate::zero_coordinate(mesh_device.shape().dims());
++        auto* device = mesh_device.get_device(coord);
++        TT_FATAL(device != nullptr, "single-device mesh has no device at {}", coord);
++        const auto noc_addr = pinned_memory->get_noc_addr(device->id());
++        TT_FATAL(noc_addr.has_value(), "pinned host tensor has no NoC mapping for device {}", device->id());
++        TT_FATAL(
++            noc_addr->device_id == device->id(),
++            "moreh_noc_map_host_tensor requires an MMIO-attached target; device {} is associated with MMIO device {}",
++            device->id(),
++            noc_addr->device_id);
++        return pinned_buffer;
++    });
++    return ttnn::Tensor(std::move(pinned_host_tensor));
++}
++
++nb::dict pinned_host_tensor_status(const ttnn::Tensor& source, tt::tt_metal::distributed::MeshDevice& mesh_device) {
++    TT_FATAL(source.storage_type() == tt::tt_metal::StorageType::HOST, "source must be a host tensor");
++    TT_FATAL(
++        mesh_device.shape().mesh_size() == 1,
++        "moreh_pinned_host_tensor_status currently requires a single-device mesh, got shape {}",
++        mesh_device.shape());
++    auto host_buffer = tt::tt_metal::host_buffer::get_host_buffer(source.host_tensor());
++    auto pinned_memory = tt::tt_metal::experimental::HostBufferGetPinnedMemory(host_buffer);
++    const auto coord = tt::tt_metal::distributed::MeshCoordinate::zero_coordinate(mesh_device.shape().dims());
++    auto* device = mesh_device.get_device(coord);
++    TT_FATAL(device != nullptr, "single-device mesh has no device at {}", coord);
++
++    nb::dict status;
++    status["attached"] = pinned_memory != nullptr;
++    status["mapped_to_device"] = pinned_memory != nullptr && pinned_memory->get_noc_addr(device->id()).has_value();
++    status["direct_transfer_enqueued"] = pinned_memory != nullptr && pinned_memory->lock_may_block();
++    status["buffer_size"] = pinned_memory != nullptr ? pinned_memory->get_buffer_size() : 0;
++    return status;
++}
++
++void drain_pinned_host_tensor(const ttnn::Tensor& source) {
++    TT_FATAL(source.storage_type() == tt::tt_metal::StorageType::HOST, "source must be a host tensor");
++    auto host_buffer = tt::tt_metal::host_buffer::get_host_buffer(source.host_tensor());
++    auto pinned_memory = tt::tt_metal::experimental::HostBufferGetPinnedMemory(host_buffer);
++    TT_FATAL(pinned_memory != nullptr, "source host tensor has no PinnedMemory attachment");
++    pinned_memory->lock();
++    pinned_memory->unlock();
++}
++
++void bind_moreh_raw_byte_copy(nb::module_& module) {
++    module.def(
++        "moreh_noc_map_host_tensor",
++        &noc_map_host_tensor,
++        nb::arg("source").noconvert(),
++        nb::arg("mesh_device"),
++        R"doc(
++	Create a host tensor view whose storage is pinned and NoC-mapped for a single-device mesh.
++
++	The returned tensor shares the source bytes but carries its own PinnedMemory attachment.
++	Pinning setup is synchronous and should be performed outside timed transfer regions.
++	)doc");
++
++    module.def(
++        "moreh_pinned_host_tensor_status",
++        &pinned_host_tensor_status,
++        nb::arg("source").noconvert(),
++        nb::arg("mesh_device"),
++        R"doc(
++	Return benchmark diagnostics for a NoC-mapped host tensor.
++
++	only when the command queue selected the direct pinned path, and remains
++	observable after the pending event has completed.
++	)doc");
++
++    module.def(
++        "moreh_drain_pinned_host_tensor",
++        &drain_pinned_host_tensor,
++        nb::arg("source").noconvert(),
++        R"doc(
++	Wait for and clear the pending direct-transfer events attached to a pinned host tensor.
++
++	This benchmark helper establishes a fresh ``direct_transfer_enqueued`` observation window.
++	)doc");
++
++    module.def(
++        "moreh_raw_byte_copy_to_torch",
++        [](const ttnn::Tensor& device_tensor,
++           CpuUint8Tensor dst,
++           std::optional<uint32_t> byte_offset,
++           std::optional<uint32_t> num_bytes,
++           bool blocking,
++           std::optional<ttnn::QueueId> cq_id) {
++            validate_raw_byte_device_tensor(device_tensor, "device_tensor");
++            const auto region = validate_raw_copy_region(device_tensor, byte_offset, num_bytes, dst.size());
++            read_raw_region(device_tensor, dst.data(), region, blocking, cq_id);
++        },
++        nb::arg("device_tensor").noconvert(),
++        nb::arg("dst").noconvert(),
++        nb::kw_only(),
++        nb::arg("byte_offset") = std::nullopt,
++        nb::arg("num_bytes") = std::nullopt,
++        nb::arg("blocking") = true,
++        nb::arg("cq_id") = nb::none(),
++        R"doc(
++	Copy raw device tensor bytes directly into an existing CPU torch.uint8-compatible buffer.
++
++	This is intentionally narrow: it is for byte-identical payloads whose physical
++	device buffer is carried as opaque bytes. Supported device tensors are UINT8
++	ROW_MAJOR and BFLOAT8_B TILE. The destination must be a contiguous CPU uint8
++	tensor or uint8 view with enough bytes.
++        )doc");
++
++    module.def(
++        "moreh_region_raw_gather_to_torch",
++        &fused_region_raw_gather_to_torch,
++        nb::arg("latent_tensor").noconvert(),
++        nb::arg("indexer_tensor").noconvert(),
++        nb::arg("dst").noconvert(),
++        nb::arg("slot_mapping").noconvert(),
++        nb::arg("starts"),
++        nb::arg("ends"),
++        nb::arg("memobj_slots"),
++        nb::arg("member_alloc_bytes"),
++        nb::arg("region_bases"),
++        nb::arg("member_widths"),
++        nb::arg("block_size"),
++        nb::arg("dp_size"),
++        nb::arg("blocks_per_dp"),
++        nb::arg("tp_size"),
++        nb::arg("rank"),
++        nb::kw_only(),
++        nb::arg("blocking") = true,
++        nb::arg("cq_id") = nb::none(),
++        R"doc(
++        Plan DSA region-raw runs and enqueue latent + indexer D2H gathers in one C++ call.
++
++        This avoids materializing member_runs as Python list[list[int]] and then
++        parsing them back into C++ for gather enqueue. The returned vector contains
++        copied byte counts for latent and indexer.
++        )doc");
++
++    module.def(
++        "moreh_region_raw_scatter_from_torch",
++        &fused_region_raw_scatter_from_torch,
++        nb::arg("src").noconvert(),
++        nb::arg("latent_tensor").noconvert(),
++        nb::arg("indexer_tensor").noconvert(),
++        nb::arg("slot_mapping").noconvert(),
++        nb::arg("starts"),
++        nb::arg("ends"),
++        nb::arg("memobj_slots"),
++        nb::arg("member_alloc_bytes"),
++        nb::arg("region_bases"),
++        nb::arg("member_widths"),
++        nb::arg("block_size"),
++        nb::arg("dp_size"),
++        nb::arg("blocks_per_dp"),
++        nb::arg("tp_size"),
++        nb::arg("rank"),
++        nb::kw_only(),
++        nb::arg("replicate_shards") = false,
++        nb::arg("group_axis") = 0,
++        nb::arg("shard_axis") = 1,
++        nb::arg("blocking") = true,
++        nb::arg("cq_id") = nb::none(),
++        R"doc(
++        Plan DSA region-raw runs and enqueue latent + indexer H2D scatters in one C++ call.
++
++        This avoids materializing member_runs as Python list[list[int]] and then
++        parsing them back into C++ for scatter enqueue. The returned vector contains
++        copied byte counts for latent and indexer. With replicate_shards=True,
++        dp_size/blocks_per_dp/tp_size are interpreted as
++        group_size/blocks_per_group/shard_count and rank is ignored.
++        )doc");
++
++    module.def(
++        "moreh_dsa_block_cyclic_region_raw_gather_to_torch",
++        &fused_dsa_block_cyclic_region_raw_gather_to_torch,
++        nb::arg("latent_tensor").noconvert(),
++        nb::arg("indexer_tensor").noconvert(),
++        nb::arg("dst").noconvert(),
++        nb::arg("slot_mapping").noconvert(),
++        nb::arg("starts"),
++        nb::arg("ends"),
++        nb::arg("memobj_slots"),
++        nb::arg("member_alloc_bytes"),
++        nb::arg("region_bases"),
++        nb::arg("member_widths"),
++        nb::arg("block_size"),
++        nb::arg("blocks_per_rank"),
++        nb::arg("block_cyclic_degree"),
++        nb::kw_only(),
++        nb::arg("blocking") = true,
++        nb::arg("cq_id") = nb::none(),
++        R"doc(
++        Plan GLM DSA CP block-cyclic full-block D2H gathers.
++        )doc");
++
++    module.def(
++        "moreh_dsa_block_cyclic_region_raw_scatter_from_torch",
++        &fused_dsa_block_cyclic_region_raw_scatter_from_torch,
++        nb::arg("src").noconvert(),
++        nb::arg("latent_tensor").noconvert(),
++        nb::arg("indexer_tensor").noconvert(),
++        nb::arg("slot_mapping").noconvert(),
++        nb::arg("starts"),
++        nb::arg("ends"),
++        nb::arg("memobj_slots"),
++        nb::arg("member_alloc_bytes"),
++        nb::arg("region_bases"),
++        nb::arg("member_widths"),
++        nb::arg("source_starts"),
++        nb::arg("block_size"),
++        nb::arg("blocks_per_rank"),
++        nb::arg("block_cyclic_degree"),
++        nb::kw_only(),
++        nb::arg("blocking") = true,
++        nb::arg("cq_id") = nb::none(),
++        R"doc(
++        Plan GLM DSA CP block-cyclic full-block H2D scatters.
++        )doc");
++
++    module.def(
++        "moreh_raw_byte_tp_interleaved_gather_to_torch",
++        &fused_tp_interleaved_region_raw_gather_to_torch,
++        nb::arg("cache_k").noconvert(),
++        nb::arg("cache_v").noconvert(),
++        nb::arg("dst").noconvert(),
++        nb::arg("slot_mapping").noconvert(),
++        nb::arg("starts"),
++        nb::arg("ends"),
++        nb::arg("memobj_slots"),
++        nb::arg("member_alloc_bytes"),
++        nb::arg("region_bases"),
++        nb::arg("shard_block_bytes"),
++        nb::arg("block_bytes"),
++        nb::arg("block_size"),
++        nb::arg("dp_size"),
++        nb::arg("blocks_per_dp"),
++        nb::arg("tp_size"),
++        nb::kw_only(),
++        nb::arg("blocking") = true,
++        nb::arg("cq_id") = nb::none(),
++        R"doc(
++        Plan Qwen-style TP-interleaved K/V region-raw runs and enqueue K + V D2H gathers.
++        )doc");
++
++    module.def(
++        "moreh_raw_byte_tp_interleaved_scatter_from_torch",
++        &fused_tp_interleaved_region_raw_scatter_from_torch,
++        nb::arg("src").noconvert(),
++        nb::arg("cache_k").noconvert(),
++        nb::arg("cache_v").noconvert(),
++        nb::arg("slot_mapping").noconvert(),
++        nb::arg("starts"),
++        nb::arg("ends"),
++        nb::arg("memobj_slots"),
++        nb::arg("member_alloc_bytes"),
++        nb::arg("region_bases"),
++        nb::arg("shard_block_bytes"),
++        nb::arg("block_bytes"),
++        nb::arg("block_size"),
++        nb::arg("dp_size"),
++        nb::arg("blocks_per_dp"),
++        nb::arg("tp_size"),
++        nb::kw_only(),
++        nb::arg("blocking") = true,
++        nb::arg("cq_id") = nb::none(),
++        R"doc(
++        Plan Qwen-style TP-interleaved K/V region-raw runs and enqueue K + V H2D scatters.
++        )doc");
++
++    module.def(
++        "moreh_raw_byte_copy_from_torch",
++        [](CpuUint8Tensor src,
++           ttnn::Tensor& device_tensor,
++           std::optional<uint32_t> byte_offset,
++           std::optional<uint32_t> num_bytes,
++           bool blocking,
++           std::optional<ttnn::QueueId> cq_id) {
++            validate_raw_byte_device_tensor(device_tensor, "device_tensor");
++            const auto region = validate_raw_copy_region(device_tensor, byte_offset, num_bytes, src.size());
++            write_raw_region(src, device_tensor, region, blocking, cq_id);
++        },
++        nb::arg("src").noconvert(),
++        nb::arg("device_tensor").noconvert(),
++        nb::kw_only(),
++        nb::arg("byte_offset") = std::nullopt,
++        nb::arg("num_bytes") = std::nullopt,
++        nb::arg("blocking") = true,
++        nb::arg("cq_id") = nb::none(),
++        R"doc(
++	Copy a contiguous CPU torch.uint8-compatible buffer into a raw device tensor region.
++
++	The caller is responsible for choosing a byte region aligned with the packed
++	device payload layout. Supported device tensors are UINT8 ROW_MAJOR and
++	BFLOAT8_B TILE. Set blocking=false only when the caller will separately
++	synchronize the target device before the source buffer can be reused.
++        )doc");
++}
++
++}  // namespace ttnn::operations::experimental::moreh_raw_byte_copy::detail
+diff --git a/ttnn/cpp/ttnn/operations/experimental/moreh_raw_byte_copy/moreh_raw_byte_copy_nanobind.hpp b/ttnn/cpp/ttnn/operations/experimental/moreh_raw_byte_copy/moreh_raw_byte_copy_nanobind.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..97bf36bf3317a635a748adad22e59227737d980c
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/experimental/moreh_raw_byte_copy/moreh_raw_byte_copy_nanobind.hpp
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <nanobind/nanobind.h>
++
++namespace ttnn::operations::experimental::moreh_raw_byte_copy::detail {
++
++namespace nb = nanobind;
++
++void bind_moreh_raw_byte_copy(nb::module_& module);
++
++}  // namespace ttnn::operations::experimental::moreh_raw_byte_copy::detail
+diff --git a/ttnn/sources.cmake b/ttnn/sources.cmake
+index edf0411c325c38f48c14913264ea247a0ed6b57f..595bd517317890c13b3458e96d3dc5cb201e8df2 100644
+--- a/ttnn/sources.cmake
++++ b/ttnn/sources.cmake
+@@ -100,6 +100,8 @@ set(TTNN_SRC_PYBIND
+     core/graph/graph_nanobind.cpp
+     cpp/ttnn/operations/experimental/deepseek_prefill/routed_expert_ffn/routed_expert_ffn_nanobind.cpp
+     cpp/ttnn/operations/experimental/deepseek_prefill/unified_routed_expert_ffn/unified_routed_expert_ffn_nanobind.cpp
++    cpp/ttnn/operations/experimental/moreh_raw_byte_copy/moreh_raw_byte_copy_nanobind.cpp
++    cpp/ttnn/operations/experimental/moreh_paged_fill_cache_varlen/moreh_paged_fill_cache_varlen_nanobind.cpp
+     cpp/ttnn/operations/experimental/experimental_nanobind.cpp
+     cpp/ttnn/operations/experimental/fusion/fusion_dispatch_op_nanobind.cpp
+     cpp/ttnn/operations/generic/generic_op_nanobind.cpp

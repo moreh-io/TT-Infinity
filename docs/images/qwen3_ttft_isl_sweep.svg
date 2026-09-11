@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="430" viewBox="0 0 800 430" role="img" aria-labelledby="title desc">
+  <title id="title">Qwen3-32B cold and warm TTFT by input sequence length</title>
+  <desc id="desc">Grouped bars compare cold and warm TTFT at six discrete measured input sequence lengths. Cold TTFT ranges from 0.594 to 2.112 seconds, and warm TTFT ranges from 0.190 to 0.575 seconds.</desc>
+  <rect width="800" height="430" fill="white"/>
+  <g font-family="sans-serif" font-size="13" fill="#24292f">
+    <text x="400" y="25" text-anchor="middle" font-size="18" font-weight="600">Qwen3-32B TTFT by ISL</text>
+    <text x="20" y="190" text-anchor="middle" transform="rotate(-90 20 190)">TTFT (seconds)</text>
+    <text x="410" y="415" text-anchor="middle">Input sequence length (tokens)</text>
+  </g>
+  <g stroke="#d0d7de" stroke-width="1">
+    <line x1="70" y1="350" x2="750" y2="350"/>
+    <line x1="70" y1="290" x2="750" y2="290"/>
+    <line x1="70" y1="230" x2="750" y2="230"/>
+    <line x1="70" y1="170" x2="750" y2="170"/>
+    <line x1="70" y1="110" x2="750" y2="110"/>
+    <line x1="70" y1="50" x2="750" y2="50"/>
+  </g>
+  <g font-family="sans-serif" font-size="12" fill="#57606a" text-anchor="end">
+    <text x="62" y="354">0.0</text><text x="62" y="294">0.5</text>
+    <text x="62" y="234">1.0</text><text x="62" y="174">1.5</text>
+    <text x="62" y="114">2.0</text><text x="62" y="54">2.5</text>
+  </g>
+  <g font-family="sans-serif" font-size="12" fill="#57606a" text-anchor="middle">
+    <text x="115" y="374">1,120</text><text x="235" y="374">2,144</text>
+    <text x="355" y="374">3,296</text><text x="475" y="374">4,192</text>
+    <text x="595" y="374">5,728</text><text x="715" y="374">7,264</text>
+  </g>
+  <g fill="#cf222e">
+    <rect x="91" y="278.72" width="22" height="71.28"/>
+    <rect x="211" y="223.16" width="22" height="126.84"/>
+    <rect x="331" y="222.80" width="22" height="127.20"/>
+    <rect x="451" y="97.76" width="22" height="252.24"/>
+    <rect x="571" y="98.00" width="22" height="252.00"/>
+    <rect x="691" y="96.56" width="22" height="253.44"/>
+  </g>
+  <g fill="#0969da">
+    <rect x="117" y="327.20" width="22" height="22.80"/>
+    <rect x="237" y="319.40" width="22" height="30.60"/>
+    <rect x="357" y="310.76" width="22" height="39.24"/>
+    <rect x="477" y="304.04" width="22" height="45.96"/>
+    <rect x="597" y="292.64" width="22" height="57.36"/>
+    <rect x="717" y="281.00" width="22" height="69.00"/>
+  </g>
+  <g font-family="sans-serif" font-size="10" fill="#24292f" text-anchor="middle">
+    <text x="102" y="272">0.594</text><text x="128" y="321">0.190</text>
+    <text x="222" y="217">1.057</text><text x="248" y="313">0.255</text>
+    <text x="342" y="217">1.060</text><text x="368" y="305">0.327</text>
+    <text x="462" y="92">2.102</text><text x="488" y="298">0.383</text>
+    <text x="582" y="92">2.100</text><text x="608" y="287">0.478</text>
+    <text x="702" y="91">2.112</text><text x="728" y="275">0.575</text>
+  </g>
+  <g font-family="sans-serif" font-size="13">
+    <rect x="545" y="17" width="25" height="12" fill="#cf222e"/><text x="577" y="29" fill="#24292f">Cold</text>
+    <rect x="635" y="17" width="25" height="12" fill="#0969da"/><text x="667" y="29" fill="#24292f">Warm</text>
+  </g>
+</svg>

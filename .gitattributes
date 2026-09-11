@@ -1,0 +1,2 @@
+third_party/tt-metal/patches/*.patch -whitespace
+third_party/vllm-tt-plugin/patches/*.patch -whitespace

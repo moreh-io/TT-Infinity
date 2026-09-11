@@ -1,0 +1,5 @@
+86425b51b8841d77561aab645227e39008d647fae483e50a906cdb3fb8626558  0001-static-intermesh-fabric.patch
+bae4a19e9a2da2042a8d7303e554a3cd642fcd221c92eb6013e6451ba7e22114  0002-cross-node-data-path-operations.patch
+259260ad9503cf82ed4c591818f22b4906ce47af75b525612cb4dbb063c81a7e  0003-kvcache-protocol-device-runtime.patch
+0aa4db3def79c54eda970c8e5213319e836483ba45c85c6e0a8a7d573d948829  0004-qwen3-runtime.patch
+77f120981303d46ee0b28a0e2c3ad11e130d6424fffc01cbd90022e04d2bd2aa  0005-lmcache-t3knic-connector.patch
